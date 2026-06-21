@@ -24,15 +24,18 @@ test('generateSessionId avoids collisions with existing IDs', () => {
 });
 
 test('generateSessionId fallback appends hex when collisions are extreme', () => {
-  // Saturate the wordlist space by generating hundreds of IDs
-  const existing = new Set();
-  for (let i = 0; i < 3000; i++) {
-    existing.add(`word-${i}`);
+  // Force Math.random to always return 0, so every attempt picks ADJECTIVES[0]-NOUNS[0]
+  // After 100 failed attempts, the fallback at line 34-35 kicks in with a hex suffix
+  const origRandom = Math.random;
+  Math.random = () => 0;
+  try {
+    const existing = new Set([`${'amber'}-${'atlas'}`]); // ADJECTIVES[0]-NOUNS[0]
+    const id = generateSessionId(existing);
+    // Should use fallback: amber-atlas-<4 hex chars>
+    assert.match(id, /^amber-atlas-[a-f0-9]{4}$/);
+  } finally {
+    Math.random = origRandom;
   }
-  const id = generateSessionId(existing);
-  // Should still produce something valid
-  assert.ok(id.length > 0);
-  assert.ok(typeof id === 'string');
 });
 
 test('generateSessionId IDs are ASCII lowercase hyphenated', () => {

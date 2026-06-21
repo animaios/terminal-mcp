@@ -731,3 +731,236 @@ test('terminal_watch forwards triggers and options', async () => {
     delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
   }
 });
+
+test('terminal_send_key sends key to session', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const sendKeyCalls = [];
+    const manager = {
+      get: () => ({
+        sendKey: (key) => { sendKeyCalls.push(key); },
+      }),
+    };
+
+    registerTools(server, manager);
+
+    const result = await server.tools.get('terminal_send_key').handler({
+      sessionId: 's1',
+      key: 'ctrl+c',
+    });
+
+    assert.deepEqual(sendKeyCalls, ['ctrl+c']);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.success, true);
+    assert.equal(payload.key, 'ctrl+c');
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_resize resizes session dimensions', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const resizeCalls = [];
+    const manager = {
+      get: () => ({
+        resize: (cols, rows) => { resizeCalls.push({ cols, rows }); },
+      }),
+    };
+
+    registerTools(server, manager);
+
+    const result = await server.tools.get('terminal_resize').handler({
+      sessionId: 's1',
+      cols: 200,
+      rows: 50,
+    });
+
+    assert.deepEqual(resizeCalls, [{ cols: 200, rows: 50 }]);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.success, true);
+    assert.equal(payload.cols, 200);
+    assert.equal(payload.rows, 50);
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_write processes escape sequences and writes to session', async () => {
+  const server = createFakeServer();
+  const writeCalls = [];
+  const manager = {
+    get: () => ({
+      write: (data) => { writeCalls.push(data); },
+    }),
+  };
+
+  registerTools(server, manager);
+
+  const result = await server.tools.get('terminal_write').handler({
+    sessionId: 's1',
+    data: 'hello\\nworld\\t!',
+  });
+
+  assert.deepEqual(writeCalls, ['hello\nworld\t!']);
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.success, true);
+});
+
+test('terminal_write_file writes content and returns size', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
+    try {
+      const manager = {
+        get: () => ({ cwd: tempDir }),
+      };
+
+      registerTools(server, manager);
+
+      const result = await server.tools.get('terminal_write_file').handler({
+        sessionId: 's1',
+        path: 'test-output.txt',
+        content: 'hello world',
+        encoding: 'utf-8',
+        append: false,
+      });
+
+      const payload = JSON.parse(result.content[0].text);
+      assert.equal(payload.success, true);
+      assert.equal(payload.append, false);
+      assert.ok(payload.size > 0);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_write_file append mode appends to existing file', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
+    try {
+      const manager = {
+        get: () => ({ cwd: tempDir }),
+      };
+
+      registerTools(server, manager);
+
+      // Write initial content
+      await server.tools.get('terminal_write_file').handler({
+        sessionId: 's1',
+        path: 'append-test.txt',
+        content: 'first',
+        encoding: 'utf-8',
+        append: false,
+      });
+
+      // Append more content
+      const result = await server.tools.get('terminal_write_file').handler({
+        sessionId: 's1',
+        path: 'append-test.txt',
+        content: ' second',
+        encoding: 'utf-8',
+        append: true,
+      });
+
+      const payload = JSON.parse(result.content[0].text);
+      assert.equal(payload.success, true);
+      assert.equal(payload.append, true);
+
+      const { readFile: rf } = await import('node:fs/promises');
+      const contents = await rf(join(tempDir, 'append-test.txt'), 'utf-8');
+      assert.equal(contents, 'first second');
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_run_paged rejects non-read-only commands', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+
+    await assert.rejects(
+      () => server.tools.get('terminal_run_paged').handler({
+        cmd: 'rm',
+        args: ['-rf', '/'],
+        page: 0,
+        pageSize: 10,
+        summary: false,
+      }),
+      /terminal_run_paged only supports read-only commands/
+    );
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_run_paged accepts git read-only subcommands', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+
+    // git branch should be accepted (read-only)
+    const result = await server.tools.get('terminal_run_paged').handler({
+      cmd: 'git',
+      args: ['branch'],
+      page: 0,
+      pageSize: 10,
+      summary: false,
+    });
+
+    // It should not reject with the read-only error
+    const payload = JSON.parse(result.content[0].text);
+    assert.ok(payload);
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_run_paged rejects git write subcommands', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+
+    await assert.rejects(
+      () => server.tools.get('terminal_run_paged').handler({
+        cmd: 'git',
+        args: ['push'],
+        page: 0,
+        pageSize: 10,
+        summary: false,
+      }),
+      /terminal_run_paged only supports read-only commands/
+    );
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});
+
+test('terminal_extra returns error when no tool is specified', async () => {
+  process.env.SMART_TERMINAL_DISABLED_TOOLS = 'terminal_diff';
+  try {
+    const server = createFakeServer();
+    registerTools(server, {});
+
+    const result = await server.tools.get('terminal_extra').handler({ list: false });
+    assert.ok(result.isError, 'should return error when no tool specified');
+    assert.match(result.content[0].text, /Pass list=true/);
+  } finally {
+    delete process.env.SMART_TERMINAL_DISABLED_TOOLS;
+  }
+});

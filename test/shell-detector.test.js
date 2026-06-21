@@ -45,3 +45,32 @@ test('detectShell returns a shell and args object', () => {
   assert.ok(Array.isArray(result.args));
   assert.ok(result.shell.length > 0);
 });
+
+test('detectShell falls back to bash or sh when SHELL is unset on Unix', { skip: process.platform === 'win32' }, () => {
+  const origShell = process.env.SHELL;
+  try {
+    delete process.env.SHELL;
+    const result = detectShell();
+    // Should fall back to bash (available) or sh
+    assert.ok(result.shell === 'bash' || result.shell === 'sh');
+    assert.deepEqual(result.args, []);
+  } finally {
+    if (origShell !== undefined) process.env.SHELL = origShell;
+  }
+});
+
+test('detectShell uses SHELL env var on Unix', { skip: process.platform === 'win32' }, () => {
+  const origShell = process.env.SHELL;
+  try {
+    process.env.SHELL = '/bin/zsh';
+    const result = detectShell();
+    assert.equal(result.shell, '/bin/zsh');
+    assert.deepEqual(result.args, []);
+  } finally {
+    if (origShell !== undefined) {
+      process.env.SHELL = origShell;
+    } else {
+      delete process.env.SHELL;
+    }
+  }
+});

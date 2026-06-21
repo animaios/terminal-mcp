@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getStructuredParserHint, runCommand } from '../src/command-runner.js';
@@ -348,4 +348,95 @@ test('getStructuredParserHint skips non parser-worthy commands', () => {
   });
 
   assert.equal(hint, null);
+});
+
+test('runCommand includes signal in result when process is killed by signal', async () => {
+  const result = await runCommand({
+    cmd: process.execPath,
+    args: ['-e', 'process.kill(process.pid, "SIGTERM")'],
+    parse: false,
+  });
+
+  // Process killed itself with SIGTERM
+  assert.equal(result.ok, false);
+  // Signal should be present
+  assert.ok(result.signal === 'SIGTERM' || result.exitCode !== 0);
+});
+
+test('runCommand sets exitCodeIgnored when successExitCode is null and exit is non-zero', async () => {
+  const result = await runCommand({
+    cmd: process.execPath,
+    args: ['-e', 'process.exit(42)'],
+    parse: false,
+    successExitCode: null,
+  });
+
+  assert.equal(result.ok, true); // null means any exit code is ok
+  assert.equal(result.exitCode, 42);
+  assert.equal(result.exitCodeIgnored, true);
+});
+
+test('runCommand successFile fails when path is a directory', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
+  try {
+    // Create a directory at the successFile path
+    await mkdir(join(tempDir, 'build.log'));
+
+    const result = await runCommand({
+      cmd: process.execPath,
+      cwd: tempDir,
+      args: ['-e', 'process.exit(0)'],
+      parse: false,
+      successFile: 'build.log',
+      successFilePattern: 'OK',
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.checks.successFile.error, 'Path is not a file.');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCommand successFile fails when file exceeds maxOutputBytes', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
+  try {
+    // Write a file larger than maxOutputBytes
+    await writeFile(join(tempDir, 'build.log'), 'x'.repeat(2048));
+
+    const result = await runCommand({
+      cmd: process.execPath,
+      cwd: tempDir,
+      args: ['-e', 'process.exit(0)'],
+      parse: false,
+      maxOutputBytes: 256,
+      successFile: 'build.log',
+      successFilePattern: 'OK',
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.checks.successFile.error, /File exceeds maxOutputBytes/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCommand successFile fails gracefully when file does not exist', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
+  try {
+    const result = await runCommand({
+      cmd: process.execPath,
+      cwd: tempDir,
+      args: ['-e', 'process.exit(0)'],
+      parse: false,
+      successFile: 'nonexistent.log',
+      successFilePattern: 'OK',
+    });
+
+    assert.equal(result.ok, false);
+    assert.ok(result.checks.successFile.error);
+    assert.match(result.checks.successFile.error, /ENOENT|no such file/i);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });

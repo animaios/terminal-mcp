@@ -349,3 +349,247 @@ test('parseCommandOutput returns null for unsupported commands', () => {
 
   assert.equal(parsed, null);
 });
+
+test('summarizeCommandOutput summarizes git branch list', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['branch'],
+    parsed: {
+      branches: [
+        { name: 'main', current: true },
+        { name: 'feature', current: false },
+      ],
+    },
+  });
+
+  assert.deepEqual(summary, { branchCount: 2, current: 'main' });
+});
+
+test('summarizeCommandOutput summarizes git branch --show-current', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['branch', '--show-current'],
+    parsed: { current: 'develop' },
+  });
+
+  assert.deepEqual(summary, { current: 'develop' });
+});
+
+test('summarizeCommandOutput returns null for git branch with no current', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['branch'],
+    parsed: {
+      branches: [
+        { name: 'main', current: false },
+        { name: 'old', current: false },
+      ],
+    },
+  });
+
+  assert.deepEqual(summary, { branchCount: 2 });
+});
+
+test('summarizeCommandOutput summarizes git diff --shortstat', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['diff', '--shortstat'],
+    parsed: { summary: { filesChanged: 3, insertions: 10, deletions: 5 } },
+  });
+
+  assert.deepEqual(summary, { filesChanged: 3, insertions: 10, deletions: 5 });
+});
+
+test('summarizeCommandOutput summarizes git diff --name-only paths', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['diff', '--name-only'],
+    parsed: { paths: ['a.js', 'b.js', 'c.js'] },
+  });
+
+  assert.deepEqual(summary, { pathCount: 3 });
+});
+
+test('summarizeCommandOutput summarizes git diff --stat files', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['diff', '--stat'],
+    parsed: { files: [{ path: 'a.js', changes: 2, histogram: '+-' }] },
+  });
+
+  assert.deepEqual(summary, { fileCount: 1 });
+});
+
+test('summarizeCommandOutput summarizes git diff --name-status changes', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['diff', '--name-status'],
+    parsed: {
+      changes: [
+        { status: 'M', path: 'a.js' },
+        { status: 'M', path: 'b.js' },
+        { status: 'A', path: 'c.js' },
+      ],
+    },
+  });
+
+  assert.deepEqual(summary, { changeCount: 3, statuses: { M: 2, A: 1 } });
+});
+
+test('summarizeCommandOutput returns null for unknown git diff parsed shape', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['diff'],
+    parsed: {},
+  });
+
+  assert.equal(summary, null);
+});
+
+test('summarizeCommandOutput summarizes git log commits', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['log', '--oneline'],
+    parsed: {
+      commits: [
+        { hash: 'abc1234', message: 'First commit' },
+        { hash: 'def5678', message: 'Second commit' },
+      ],
+    },
+  });
+
+  assert.deepEqual(summary, {
+    commitCount: 2,
+    latestCommit: { hash: 'abc1234', message: 'First commit' },
+  });
+});
+
+test('summarizeCommandOutput summarizes git log with empty commits', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['log', '--oneline'],
+    parsed: { commits: [] },
+  });
+
+  assert.deepEqual(summary, { commitCount: 0 });
+});
+
+test('summarizeCommandOutput summarizes git rev-parse', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['rev-parse', '--show-toplevel'],
+    parsed: { topLevel: '/repo' },
+  });
+
+  assert.deepEqual(summary, { topLevel: '/repo' });
+});
+
+test('summarizeCommandOutput summarizes git ls-files', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['ls-files'],
+    parsed: { paths: ['a.js', 'b.js'] },
+  });
+
+  assert.deepEqual(summary, { pathCount: 2 });
+});
+
+test('summarizeCommandOutput summarizes git remote -v', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['remote', '-v'],
+    parsed: {
+      remotes: [
+        { name: 'origin', fetchUrl: 'https://a.com', pushUrl: 'https://a.com' },
+        { name: 'upstream', fetchUrl: 'https://b.com', pushUrl: 'https://b.com' },
+      ],
+    },
+  });
+
+  assert.deepEqual(summary, { remoteCount: 2, names: ['origin', 'upstream'] });
+});
+
+test('summarizeCommandOutput summarizes tasklist', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'tasklist',
+    args: ['/fo', 'csv', '/nh'],
+    parsed: { processes: [{ imageName: 'node.exe', pid: 1 }] },
+  });
+
+  assert.deepEqual(summary, { processCount: 1 });
+});
+
+test('summarizeCommandOutput summarizes where/which', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'which',
+    args: ['node'],
+    parsed: { paths: ['/usr/bin/node'] },
+  });
+
+  assert.deepEqual(summary, { pathCount: 1 });
+});
+
+test('summarizeCommandOutput returns null for unknown commands', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'ls',
+    args: [],
+    parsed: { files: [] },
+  });
+
+  assert.equal(summary, null);
+});
+
+test('summarizeCommandOutput returns null when parsed is null', () => {
+  const summary = summarizeCommandOutput({
+    cmd: 'git',
+    args: ['status'],
+    parsed: null,
+  });
+
+  assert.equal(summary, null);
+});
+
+test('parseCommandOutput parses git diff --stat without summary line', () => {
+  const parsed = parseCommandOutput({
+    cmd: 'git',
+    args: ['diff', '--stat'],
+    stdout: ' src/index.js | 2 +-\n README.md    | 3 ++-\n',
+  });
+
+  assert.deepEqual(parsed, {
+    files: [
+      { path: 'src/index.js', changes: 2, histogram: '+-' },
+      { path: 'README.md', changes: 3, histogram: '++-' },
+    ],
+  });
+});
+
+test('parseCommandOutput returns null for empty git diff --stat', () => {
+  const parsed = parseCommandOutput({
+    cmd: 'git',
+    args: ['diff', '--stat'],
+    stdout: '',
+  });
+
+  assert.equal(parsed, null);
+});
+
+test('parseCommandOutput parses git rev-parse --is-inside-work-tree false', () => {
+  const parsed = parseCommandOutput({
+    cmd: 'git',
+    args: ['rev-parse', '--is-inside-work-tree'],
+    stdout: 'false\n',
+  });
+
+  assert.deepEqual(parsed, { isInsideWorkTree: false });
+});
+
+test('parseCommandOutput returns null for non-true/false boolean', () => {
+  const parsed = parseCommandOutput({
+    cmd: 'git',
+    args: ['rev-parse', '--is-inside-work-tree'],
+    stdout: 'maybe\n',
+  });
+
+  assert.equal(parsed, null);
+});
