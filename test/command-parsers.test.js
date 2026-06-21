@@ -1,9 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { platform } from 'node:os';
 import { normalizeCommandName, parseCommandOutput, summarizeCommandOutput } from '../src/command-parsers.js';
 
-test('normalizeCommandName removes executable extensions', () => {
+test('normalizeCommandName removes executable extensions', { skip: platform() !== 'win32' }, () => {
   assert.equal(normalizeCommandName('C:\\Windows\\System32\\where.exe'), 'where');
+});
+
+test('normalizeCommandName strips .exe from simple names', () => {
+  assert.equal(normalizeCommandName('where.exe'), 'where');
+  assert.equal(normalizeCommandName('git.exe'), 'git');
+});
+
+test('normalizeCommandName leaves non-exe names unchanged', () => {
+  assert.equal(normalizeCommandName('git'), 'git');
+  assert.equal(normalizeCommandName('bash'), 'bash');
+  assert.equal(normalizeCommandName('/usr/bin/python'), 'python');
 });
 
 test('parseCommandOutput parses git log --oneline', () => {

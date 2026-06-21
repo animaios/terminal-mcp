@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { buildSessionEnv, PtySession } from '../src/pty-session.js';
+import { stripAnsi } from '../src/ansi.js';
 
 function createSession() {
   return Object.create(PtySession.prototype);
@@ -46,7 +48,8 @@ test('_initShell suppresses PowerShell progress output', async () => {
   const writes = [];
   let resetCalls = 0;
   session.shellType = 'powershell';
-  session.process = { write: (value) => writes.push(value) };
+  session._daemonSessionId = 1;
+  session.ptydClient = { write: (_id, value) => writes.push(value) };
   session._readUntilIdle = async () => '';
   session._resetBuffer = () => {
     resetCalls++;
@@ -63,7 +66,8 @@ test('_initShell sets cmd sessions to UTF-8', async () => {
   const writes = [];
   let resetCalls = 0;
   session.shellType = 'cmd';
-  session.process = { write: (value) => writes.push(value) };
+  session._daemonSessionId = 1;
+  session.ptydClient = { write: (_id, value) => writes.push(value) };
   session._readUntilIdle = async () => '';
   session._resetBuffer = () => {
     resetCalls++;
@@ -321,27 +325,25 @@ test('read with since beyond current position waits for data', async () => {
   assert.equal(result.position, 112);
 });
 
-test('kill uses process group kill on Unix', () => {
+test('kill uses daemon signal on process group', () => {
   const session = createSession();
   session.alive = true;
-  const kills = [];
-  session.process = {
-    pid: 12345,
-    kill: (sig) => kills.push({ method: 'pty', signal: sig }),
+  session._daemonSessionId = 1;
+  const signals = [];
+  session.ptydClient = {
+    signal: (id, sig) => signals.push({ id, sig }),
   };
-
-  const originalPlatform = process.platform;
-  // We can't actually change process.platform, but we can test the code path
-  // by checking the logic directly
 
   session.kill();
   assert.equal(session.alive, false);
+  assert.deepEqual(signals, [{ id: 1, sig: 'SIGTERM' }]);
 });
 
 test('kill is idempotent', () => {
   const session = createSession();
   session.alive = false;
-  session.process = { pid: 12345 };
+  session._daemonSessionId = 1;
+  session.ptydClient = { signal: () => {} };
 
   // Should not throw
   session.kill();
@@ -351,7 +353,7 @@ test('kill is idempotent', () => {
 test('_waitForMarker returns reason marker on completion', async () => {
   const session = createSession();
   session.alive = true;
-  session._buffer = 'output__MCP_DONE_abc__';
+  session._buffer = 'output\n__MCP_DONE_abc__';
   session._dataListeners = [];
 
   const resultPromise = session._waitForMarker('__MCP_DONE_abc__', 500);
@@ -528,6 +530,677 @@ test('watch with since skips already-emitted output', async () => {
   });
 
   // Should resolve immediately from existing buffer
+  const result = await resultPromise;
+  assert.equal(result.reason, 'trigger');
+  assert.equal(result.triggerId, 'found');
+});
+
+// ── exec() error paths ─────────────────────────────────────────────────────
+
+test('exec throws when session is busy', async () => {
+  const session = createSession();
+  session.alive = true;
+  session.busy = true;
+  session.id = 'test-session';
+
+  await assert.rejects(
+    () => session.exec({ command: 'echo hi' }),
+    /is busy with a background command/,
+  );
+});
+
+test('exec throws when session is not alive', async () => {
+  const session = createSession();
+  session.alive = false;
+  session.busy = false;
+  session.id = 'test-session';
+
+  await assert.rejects(
+    () => session.exec({ command: 'echo hi' }),
+    /is no longer alive/,
+  );
+});
+
+test('exec re-throws underlying errors and resets busy', async () => {
+  const session = createSession();
+  session.alive = true;
+  session.busy = false;
+  session.id = 'test-session';
+  session._daemonSessionId = 1;
+  session._buffer = '';
+  session._readCursor = 0;
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+  session.shellType = 'bash';
+  // ptydClient.write throws inside the try block
+  session.ptydClient = {
+    write: () => { throw new Error('write failed'); },
+  };
+
+  await assert.rejects(
+    () => session.exec({ command: 'echo hi', timeout: 100 }),
+    /write failed/,
+  );
+  assert.equal(session.busy, false);
+  assert.equal(session._pendingMarker, null);
+});
+
+test('exec sets pendingMarker when marker not found within wait', async () => {
+  const session = createSession();
+  session.alive = true;
+  session.busy = false;
+  session.id = 'test-session';
+  session._daemonSessionId = 1;
+  session._buffer = '';
+  session._readCursor = 0;
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+  session.shellType = 'bash';
+  session.ptydClient = {
+    write: () => {},
+  };
+
+  // Use short timeouts so it completes quickly
+  const resultPromise = session.exec({
+    command: 'sleep 100',
+    timeout: 200,
+    quietExitMs: 50,
+    minOutputBytes: 1,
+  });
+
+  // Feed some output so quiet timer arms, but no marker
+  setTimeout(() => {
+    const onData = session._dataListeners.at(-1);
+    if (onData) {
+      session._buffer = 'some output';
+      onData('some output');
+    }
+  }, 20);
+
+  const result = await resultPromise;
+  // Should time out or go quiet (no marker found)
+  assert.equal(result.exitCode, null);
+});
+
+// ── write() / sendKey() ────────────────────────────────────────────────────
+
+test('write throws when session is not alive', () => {
+  const session = createSession();
+  session.alive = false;
+  session.id = 'test-session';
+
+  assert.throws(
+    () => session.write('hello'),
+    /is no longer alive/,
+  );
+});
+
+test('write sends data to daemon session', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 7;
+  const writes = [];
+  session.ptydClient = { write: (id, data) => writes.push({ id, data }) };
+
+  session.write('hello world');
+  assert.deepEqual(writes, [{ id: 7, data: 'hello world' }]);
+});
+
+test('write clears busy state when ctrl+c is sent', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 1;
+  session.busy = true;
+  session._pendingMarker = 'some_marker';
+  session.ptydClient = { write: () => {} };
+
+  session.write('\x03'); // ctrl+c
+  assert.equal(session.busy, false);
+  assert.equal(session._pendingMarker, null);
+});
+
+test('write clears busy state when ctrl+d is sent', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 1;
+  session.busy = true;
+  session._pendingMarker = 'some_marker';
+  session.ptydClient = { write: () => {} };
+
+  session.write('\x04'); // ctrl+d
+  assert.equal(session.busy, false);
+  assert.equal(session._pendingMarker, null);
+});
+
+test('sendKey throws for unknown key', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 1;
+  session.ptydClient = { write: () => {} };
+
+  assert.throws(
+    () => session.sendKey('nonexistent-key'),
+    /Unknown key: "nonexistent-key"/,
+  );
+});
+
+test('sendKey sends correct escape sequence', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 1;
+  const writes = [];
+  session.ptydClient = { write: (id, data) => writes.push(data) };
+
+  session.sendKey('ctrl+c');
+  assert.deepEqual(writes, ['\x03']);
+});
+
+// ── read() when not alive ──────────────────────────────────────────────────
+
+test('read returns leftover buffer when session is not alive', async () => {
+  const session = createSession();
+  session.alive = false;
+  session._buffer = 'final output here';
+  session._readCursor = 0;
+  session._totalBytesEmitted = 50;
+  session._dataListeners = [];
+
+  const result = await session.read({ timeout: 50, idleTimeout: 10 });
+  assert.equal(result.output, 'final output here');
+  assert.equal(result.timedOut, false);
+  assert.equal(result.position, 50);
+});
+
+// ── waitForPattern() when not alive ────────────────────────────────────────
+
+test('waitForPattern throws when session is not alive', async () => {
+  const session = createSession();
+  session.alive = false;
+  session.id = 'test-session';
+
+  await assert.rejects(
+    () => session.waitForPattern({ pattern: 'ready', timeout: 50 }),
+    /is no longer alive/,
+  );
+});
+
+// ── resize() ────────────────────────────────────────────────────────────────
+
+test('resize throws when session is not alive', () => {
+  const session = createSession();
+  session.alive = false;
+  session.id = 'test-session';
+
+  assert.throws(
+    () => session.resize(120, 40),
+    /is no longer alive/,
+  );
+});
+
+test('resize sends command and updates cols/rows', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 5;
+  const calls = [];
+  session.ptydClient = { resize: (id, cols, rows) => calls.push({ id, cols, rows }) };
+
+  session.resize(160, 50);
+  assert.deepEqual(calls, [{ id: 5, cols: 160, rows: 50 }]);
+  assert.equal(session.cols, 160);
+  assert.equal(session.rows, 50);
+});
+
+// ── getInfo() verbose ──────────────────────────────────────────────────────
+
+test('getInfo returns full metadata when verbose is true', () => {
+  const session = createSession();
+  session.id = 's1';
+  session.name = 'main';
+  session.cwd = '/repo';
+  session.alive = true;
+  session.busy = false;
+  session.shell = '/bin/bash';
+  session.shellType = 'bash';
+  session.cols = 120;
+  session.rows = 30;
+  session.createdAt = Date.now() - 5000;
+  session.lastActivity = Date.now() - 1000;
+
+  const info = session.getInfo({ verbose: true });
+  assert.equal(info.id, 's1');
+  assert.equal(info.name, 'main');
+  assert.equal(info.shell, '/bin/bash');
+  assert.equal(info.shellType, 'bash');
+  assert.equal(info.cols, 120);
+  assert.equal(info.rows, 30);
+  assert.ok(info.createdAt);
+  assert.ok(info.lastActivity);
+  assert.equal(typeof info.idleSeconds, 'number');
+});
+
+test('getInfo defaults to verbose=true', () => {
+  const session = createSession();
+  session.id = 's1';
+  session.name = null;
+  session.cwd = '/repo';
+  session.alive = true;
+  session.busy = false;
+  session.shell = '/bin/bash';
+  session.shellType = 'bash';
+  session.cols = 120;
+  session.rows = 30;
+  session.createdAt = Date.now();
+  session.lastActivity = Date.now();
+
+  const info = session.getInfo();
+  assert.ok('shell' in info);
+  assert.ok('shellType' in info);
+  assert.ok('createdAt' in info);
+});
+
+// ── _appendToHistory eviction ──────────────────────────────────────────────
+
+test('_appendToHistory evicts oldest lines when over capacity', () => {
+  const session = createSession();
+  session._history = Array.from({ length: 9999 }, (_, i) => `line${i}`);
+  session._historyTotalLines = 9999;
+  session._historyPartial = '';
+
+  // Append 5 more lines to push over the 10000 limit
+  session._appendToHistory('a\nb\nc\nd\ne\n');
+
+  assert.ok(session._history.length <= 10000);
+  assert.equal(session._historyTotalLines, 10004);
+});
+
+test('_appendToHistory handles partial lines correctly', () => {
+  const session = createSession();
+  session._history = [];
+  session._historyTotalLines = 0;
+  session._historyPartial = 'prefix';
+
+  session._appendToHistory('-suffix\nsecond line\n');
+
+  assert.equal(session._history[0], 'prefix-suffix');
+  assert.equal(session._history[1], 'second line');
+  assert.equal(session._historyPartial, '');
+});
+
+// ── _wrapCommand for cmd ───────────────────────────────────────────────────
+
+test('_wrapCommand uses cmd syntax for cmd shell type', () => {
+  const session = createSession();
+  session.shellType = 'cmd';
+
+  const wrapped = session._wrapCommand('echo hi', '__DONE__', '__CWD_', '__PRE__');
+  assert.match(wrapped, /echo __PRE__/);
+  assert.match(wrapped, /echo __DONE___%ERRORLEVEL%__/);
+  assert.match(wrapped, /echo __CWD_%CD%__/);
+});
+
+// ── _onOutput / _onExit handler behavior ────────────────────────────────────
+
+test('_onOutput detects pending marker at line start', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 1, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  session._pendingMarker = '__MCP_DONE_xyz__';
+  session.busy = true;
+
+  // First call: command echo with marker in string (should NOT trigger)
+  mockClient.emit('output', 1, Buffer.from('echo "__MCP_DONE_xyz__"'));
+  assert.equal(session._pendingMarker, '__MCP_DONE_xyz__');
+  assert.equal(session.busy, true);
+
+  // Second call: marker appears at start of a new line
+  mockClient.emit('output', 1, Buffer.from('\n__MCP_DONE_xyz___0__\n'));
+  assert.equal(session._pendingMarker, null);
+  assert.equal(session.busy, false);
+});
+
+test('_onOutput ignores output for different daemon session', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 1, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  mockClient.emit('output', 999, Buffer.from('output for other session'));
+  assert.equal(session._buffer, '');
+});
+
+test('_onExit marks session as not alive for correct daemon id', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 5, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  mockClient.emit('exit', 5);
+  assert.equal(session.alive, false);
+});
+
+test('_onExit ignores exit for different daemon session', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 5, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  mockClient.emit('exit', 999);
+  assert.equal(session.alive, true);
+});
+
+// ── Buffer overflow cap ─────────────────────────────────────────────────────
+
+test('_onOutput caps buffer at MAX_BUFFER_BYTES', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 1, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  // Simulate 1.5MB of output
+  const bigData = 'x'.repeat(1024 * 1024 + 512 * 1024);
+  mockClient.emit('output', 1, Buffer.from(bigData));
+
+  assert.ok(session._buffer.length <= 1024 * 1024);
+});
+
+// ── _sendProgress ───────────────────────────────────────────────────────────
+
+test('_sendProgress sends formatted notification', () => {
+  const session = createSession();
+  const calls = [];
+  const sendNotification = (msg) => calls.push(msg);
+
+  session._sendProgress(sendNotification, 'token-123', 'last line here\nanother line', Date.now() - 2000, 10000);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'notifications/progress');
+  assert.equal(calls[0].params.progressToken, 'token-123');
+  assert.match(calls[0].params.message, /\[2s\] another line/);
+});
+
+test('_sendProgress handles empty content gracefully', () => {
+  const session = createSession();
+  const calls = [];
+  const sendNotification = (msg) => calls.push(msg);
+
+  session._sendProgress(sendNotification, 'tok', '', Date.now(), 5000);
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].params.message, /\[0s\]\s*/);
+});
+
+test('_sendProgress swallows errors from sendNotification', () => {
+  const session = createSession();
+  const sendNotification = () => { throw new Error('notify failed'); };
+
+  // Should not throw
+  assert.doesNotThrow(() => {
+    session._sendProgress(sendNotification, 'tok', 'content', Date.now(), 5000);
+  });
+});
+
+// ── _tailOutput ─────────────────────────────────────────────────────────────
+
+test('_tailOutput returns full output when under limit', () => {
+  const session = createSession();
+  const result = session._tailOutput('line1\nline2\nline3', 5);
+  assert.equal(result, 'line1\nline2\nline3');
+});
+
+test('_tailOutput returns only tail lines when over limit', () => {
+  const session = createSession();
+  const result = session._tailOutput('line1\nline2\nline3\nline4\nline5', 2);
+  assert.equal(result, 'line4\nline5');
+});
+
+// ── _formatWaitOutput ───────────────────────────────────────────────────────
+
+test('_formatWaitOutput returns empty for match-only mode', () => {
+  const session = createSession();
+  const result = session._formatWaitOutput('some output', 'match-only', 50, null);
+  assert.equal(result, '');
+});
+
+test('_formatWaitOutput returns empty for empty output', () => {
+  const session = createSession();
+  const result = session._formatWaitOutput('   ', 'tail', 50, null);
+  assert.equal(result, '');
+});
+
+test('_formatWaitOutput uses _tailOutput when no tailTracker', () => {
+  const session = createSession();
+  const output = 'line1\nline2\nline3\nline4\nline5';
+  const result = session._formatWaitOutput(output, 'tail', 2, null);
+  assert.equal(result, 'line4\nline5');
+});
+
+test('_formatWaitOutput uses tailTracker when provided', () => {
+  const session = createSession();
+  const tracker = { lines: ['tracked1', 'tracked2'], partial: 'last' };
+  const result = session._formatWaitOutput('anything', 'tail', 50, tracker);
+  assert.equal(result, 'tracked1\ntracked2\nlast');
+});
+
+// ── _waitForMarker with progress notifications ──────────────────────────────
+
+test('_waitForMarker sends progress notifications when configured', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._dataListeners = [];
+  session._history = [];
+  session._historyTotalLines = 0;
+  session._historyPartial = '';
+
+  const progressCalls = [];
+  const sendNotification = (msg) => progressCalls.push(msg);
+
+  const resultPromise = session._waitForMarker(
+    '__DONE__',
+    2000,
+    undefined,
+    1,
+    sendNotification,
+    'progress-token-1',
+  );
+
+  // Feed data to trigger onData (>1s apart for progress to fire)
+  const onData = session._dataListeners.at(-1);
+  session._buffer = 'some data';
+  onData('some data');
+
+  // Wait a tiny bit and resolve with marker
+  await new Promise((r) => setTimeout(r, 10));
+  session._buffer = 'some data\n__DONE__';
+  onData('\n__DONE__');
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'marker');
+});
+
+// ── _parseOutput plain marker ───────────────────────────────────────────────
+
+test('_parseOutput handles plain marker without exit code', () => {
+  const session = createSession();
+  const marker = '__MCP_DONE_xyz__';
+  const cwdMarker = '__MCP_CWD_';
+  const preMarker = '__MCP_PRE_abc__';
+  const raw = [
+    preMarker,
+    'some output',
+    marker, // plain marker without exit code suffix
+    `${cwdMarker}/repo__`,
+  ].join('\n');
+
+  const result = session._parseOutput(raw, marker, cwdMarker, preMarker);
+  assert.equal(result.output, 'some output');
+  assert.equal(result.exitCode, null);
+  assert.equal(result.cwd, '/repo');
+});
+
+// ── watch() context buffer overflow ─────────────────────────────────────────
+
+test('watch contextBuffer does not grow beyond contextLines + 1', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'done', pattern: 'DONE' }],
+    timeout: 5000,
+    contextLines: 2,
+  });
+
+  const onData = session._dataListeners.at(-1);
+  // Feed 5 lines before the trigger
+  for (let i = 1; i <= 5; i++) {
+    onData(`line ${i}\n`);
+    session._totalBytesEmitted += 7;
+  }
+  onData('DONE\n');
+  session._totalBytesEmitted += 5;
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'trigger');
+  // context should only have the last contextLines entries
+  assert.ok(result.context.length <= 3);
+});
+
+// ── watch() process exit detection ──────────────────────────────────────────
+
+test('watch detects process exit via interval check', async () => {
+  const session = createSession();
+  session.alive = true;
+  session._buffer = '';
+  session._totalBytesEmitted = 0;
+  session._dataListeners = [];
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'x', pattern: 'never-match-this-xyz' }],
+    timeout: 10000,
+  });
+
+  // Simulate process death after a short delay
+  setTimeout(() => { session.alive = false; }, 50);
+
+  const result = await resultPromise;
+  assert.equal(result.reason, 'exit');
+  assert.equal(result.timedOut, false);
+});
+
+// ── kill() suppresses signal errors ─────────────────────────────────────────
+
+test('kill suppresses errors from ptydClient.signal', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = 1;
+  session.ptydClient = {
+    signal: () => { throw new Error('signal failed'); },
+  };
+
+  // Should not throw
+  assert.doesNotThrow(() => session.kill());
+  assert.equal(session.alive, false);
+});
+
+test('kill skips signal when daemonSessionId is null', () => {
+  const session = createSession();
+  session.alive = true;
+  session._daemonSessionId = null;
+  session.ptydClient = { signal: () => { throw new Error('should not be called'); } };
+
+  assert.doesNotThrow(() => session.kill());
+  assert.equal(session.alive, false);
+});
+
+// ── waitForPattern with async data arrival ──────────────────────────────────
+
+test('waitForPattern matches pattern via data listener with progress', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 1, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  const progressCalls = [];
+  const sendNotification = (msg) => progressCalls.push(msg);
+
+  const resultPromise = session.waitForPattern({
+    pattern: 'server ready',
+    timeout: 5000,
+    sendNotification,
+    progressToken: 'token-1',
+  });
+
+  // Feed data via the daemon output event
+  setTimeout(() => {
+    mockClient.emit('output', 1, Buffer.from('starting up...\n'));
+  }, 10);
+  setTimeout(() => {
+    mockClient.emit('output', 1, Buffer.from('server ready\n'));
+  }, 20);
+
+  const result = await resultPromise;
+  assert.equal(result.matched, true);
+  assert.equal(result.timedOut, false);
+});
+
+// ── watch with existing buffer via proper init ──────────────────────────────
+
+test('watch processes existing buffer lines when since is in range', async () => {
+  const mockClient = new EventEmitter();
+  mockClient.start = async () => ({ sessionId: 1, pid: 100 });
+  mockClient.write = () => {};
+
+  const session = new PtySession({
+    id: 'test', shell: '/bin/bash', shellArgs: [], cols: 80, rows: 24,
+    cwd: '/tmp', ptydClient: mockClient,
+  });
+  await session.init();
+
+  // Populate buffer with data
+  session._buffer = 'line one\nline two\ntrigger here\n';
+  session._totalBytesEmitted = 100;
+
+  const resultPromise = session.watch({
+    triggers: [{ id: 'found', pattern: 'trigger' }],
+    timeout: 2000,
+    since: 70, // within buffer range (bufferStart=69, offset=1)
+  });
+
   const result = await resultPromise;
   assert.equal(result.reason, 'trigger');
   assert.equal(result.triggerId, 'found');

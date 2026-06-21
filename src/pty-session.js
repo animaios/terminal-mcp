@@ -1,4 +1,3 @@
-import * as pty from 'node-pty';
 import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { stripAnsi } from './ansi.js';
@@ -90,8 +89,9 @@ export class PtySession {
    * @param {string} opts.cwd
    * @param {string} [opts.name]
    * @param {Record<string, string>} [opts.env]
+   * @param {import('./ptyd-client.js').PtydClient} opts.ptydClient
    */
-  constructor({ id, shell, shellArgs, cols, rows, cwd, name, env: customEnv }) {
+  constructor({ id, shell, shellArgs, cols, rows, cwd, name, env: customEnv, ptydClient }) {
     this.id = id;
     this.shell = shell;
     this.shellType = getShellType(shell);
@@ -103,6 +103,13 @@ export class PtySession {
     this.lastActivity = Date.now();
     this.busy = false;
     this.alive = true;
+
+    this.ptydClient = ptydClient;
+    this._customEnv = customEnv;
+    /** @type {number|null} Daemon-assigned session ID */
+    this._daemonSessionId = null;
+    /** @type {number|null} Child PID */
+    this._pid = null;
 
     /** @type {string} */
     this._buffer = '';
@@ -120,26 +127,41 @@ export class PtySession {
     this._dataListeners = [];
     /** @type {string | null} */
     this._pendingMarker = null;
+  }
 
-    const env = buildSessionEnv(customEnv);
+  /**
+   * Async initialization — spawns the PTY via the daemon and registers event handlers.
+   * Must be called after construction and before using the session.
+   * @returns {Promise<void>}
+   */
+  async init() {
+    const env = buildSessionEnv(this._customEnv);
 
-    this.process = pty.spawn(shell, shellArgs, {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd,
+    const { sessionId, pid } = await this.ptydClient.start({
+      shell: this.shell,
+      args: [],
+      cols: this.cols,
+      rows: this.rows,
+      cwd: this.cwd,
       env,
-      useConpty: false,
     });
 
-    this.process.onData((data) => {
-      this.lastActivity = Date.now();
-      this._buffer += data;
-      this._totalBytesEmitted += data.length;
+    this._daemonSessionId = sessionId;
+    this._pid = pid;
 
-      if (this._pendingMarker && this._buffer.includes(this._pendingMarker)) {
-        this.busy = false;
-        this._pendingMarker = null;
+    this._onOutput = (daemonId, data) => {
+      if (daemonId !== this._daemonSessionId) return;
+      this.lastActivity = Date.now();
+      const strData = data.toString('utf8');
+      this._buffer += strData;
+      this._totalBytesEmitted += strData.length;
+
+      if (this._pendingMarker) {
+        const clean = stripAnsi(this._buffer);
+        if (clean.includes(`\n${this._pendingMarker}`) || clean.startsWith(this._pendingMarker)) {
+          this.busy = false;
+          this._pendingMarker = null;
+        }
       }
 
       // Enforce buffer cap — keep tail
@@ -149,15 +171,19 @@ export class PtySession {
         this._readCursor = Math.max(0, this._readCursor - overflow);
       }
       // Append cleaned output to rolling history
-      this._appendToHistory(data);
+      this._appendToHistory(strData);
       for (const listener of this._dataListeners) {
-        listener(data);
+        listener(strData);
       }
-    });
+    };
 
-    this.process.onExit(() => {
+    this._onExit = (daemonId) => {
+      if (daemonId !== this._daemonSessionId) return;
       this.alive = false;
-    });
+    };
+
+    this.ptydClient.on('output', this._onOutput);
+    this.ptydClient.on('exit', this._onExit);
   }
 
   /**
@@ -173,10 +199,10 @@ export class PtySession {
 
   async _initShell() {
     if (this.shellType === 'powershell') {
-      this.process.write('$ProgressPreference = \'SilentlyContinue\'\r');
+      this.ptydClient.write(this._daemonSessionId, '$ProgressPreference = \'SilentlyContinue\'\r');
       await this._readUntilIdle(3000, 500);
     } else if (this.shellType === 'cmd') {
-      this.process.write('chcp 65001 > nul\r');
+      this.ptydClient.write(this._daemonSessionId, 'chcp 65001 > nul\r');
       await this._readUntilIdle(3000, 500);
     }
     // Clear buffer after init so it doesn't pollute first command output
@@ -212,7 +238,7 @@ export class PtySession {
     const wrappedCommand = this._wrapCommand(command, marker, cwdMarker, preMarker);
 
     try {
-      this.process.write(wrappedCommand + '\r');
+      this.ptydClient.write(this._daemonSessionId, wrappedCommand + '\r');
 
       const { buffer: raw, reason } = await this._waitForMarker(marker, timeout, quietExitMs, minOutputBytes, sendNotification, progressToken);
       const markerFound = raw.includes(marker);
@@ -252,7 +278,7 @@ export class PtySession {
     if (!this.alive) {
       throw new Error(`Session ${this.id} is no longer alive.`);
     }
-    this.process.write(data);
+    this.ptydClient.write(this._daemonSessionId, data);
     if (data.includes('\x03') || data.includes('\x04')) {
       this.busy = false;
       this._pendingMarker = null;
@@ -554,30 +580,20 @@ export class PtySession {
     if (!this.alive) {
       throw new Error(`Session ${this.id} is no longer alive.`);
     }
-    this.process.resize(cols, rows);
+    this.ptydClient.resize(this._daemonSessionId, cols, rows);
     this.cols = cols;
     this.rows = rows;
   }
 
   /**
    * Kill the PTY process and clean up.
-   * On Unix, kills the entire process group to prevent orphan children.
+   * Sends signal to the entire process group via the daemon.
    * @param {string} [signal='SIGTERM']
    */
   kill(signal = 'SIGTERM') {
     if (!this.alive) return;
-    const pid = this.process.pid;
-
-    if (process.platform !== 'win32' && pid) {
-      try {
-        process.kill(-pid, signal);
-      } catch (err) {
-        if (err.code !== 'ESRCH') {
-          try { this.process.kill(signal); } catch {}
-        }
-      }
-    } else {
-      try { this.process.kill(); } catch {}
+    if (this._daemonSessionId !== null) {
+      try { this.ptydClient.signal(this._daemonSessionId, signal); } catch {}
     }
     this.alive = false;
   }
@@ -735,7 +751,10 @@ export class PtySession {
       };
 
       const checkBuffer = () => {
-        if (this._buffer.includes(marker)) {
+        // Check for marker at the start of a line to avoid matching
+        // the marker text in the echoed command (which hasn't been executed yet)
+        const clean = stripAnsi(this._buffer);
+        if (clean.includes(`\n${marker}`) || clean.startsWith(marker)) {
           cleanup();
           resolve({ buffer: this._buffer, reason: 'marker' });
         }

@@ -15,10 +15,11 @@ const CWD_ERROR_MESSAGES = {
 };
 
 export class SessionManager {
-  constructor({ SessionClass = PtySession } = {}) {
+  constructor({ SessionClass = PtySession, ptydClient } = {}) {
     /** @type {Map<string, PtySession>} */
     this._sessions = new Map();
     this._SessionClass = SessionClass;
+    this._ptydClient = ptydClient;
     this._cleanupTimer = setInterval(() => this._cleanupExpired(), CLEANUP_INTERVAL_MS);
     // Don't keep process alive just for cleanup
     this._cleanupTimer.unref();
@@ -55,7 +56,10 @@ export class SessionManager {
       cwd: resolvedCwd,
       name,
       env,
+      ptydClient: this._ptydClient,
     });
+
+    await session.init();
 
     this._sessions.set(id, session);
     return session;
@@ -105,6 +109,9 @@ export class SessionManager {
     }
     this._sessions.clear();
     clearInterval(this._cleanupTimer);
+    if (this._ptydClient) {
+      this._ptydClient.disconnect();
+    }
   }
 
   /**
