@@ -1,21 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { platform } from 'node:os';
 import { normalizeCommandName, parseCommandOutput, summarizeCommandOutput } from '../src/command-parsers.js';
 
-test('normalizeCommandName removes executable extensions', { skip: platform() !== 'win32' }, () => {
-  assert.equal(normalizeCommandName('C:\\Windows\\System32\\where.exe'), 'where');
-});
-
-test('normalizeCommandName strips .exe from simple names', () => {
-  assert.equal(normalizeCommandName('where.exe'), 'where');
-  assert.equal(normalizeCommandName('git.exe'), 'git');
-});
-
-test('normalizeCommandName leaves non-exe names unchanged', () => {
+test('normalizeCommandName returns lowercase basename', () => {
   assert.equal(normalizeCommandName('git'), 'git');
   assert.equal(normalizeCommandName('bash'), 'bash');
   assert.equal(normalizeCommandName('/usr/bin/python'), 'python');
+  assert.equal(normalizeCommandName('Git'), 'git');
 });
 
 test('parseCommandOutput parses git log --oneline', () => {
@@ -273,35 +264,17 @@ test('parseCommandOutput parses git remote -v output', () => {
   });
 });
 
-test('parseCommandOutput parses tasklist csv output', () => {
+test('parseCommandOutput parses which output as paths', () => {
   const parsed = parseCommandOutput({
-    cmd: 'tasklist',
-    args: ['/fo', 'csv', '/nh'],
-    stdout: '"node.exe","1234","Console","1","25,000 K"\n',
-  });
-
-  assert.deepEqual(parsed, {
-    processes: [{
-      imageName: 'node.exe',
-      pid: 1234,
-      sessionName: 'Console',
-      sessionNumber: 1,
-      memUsage: '25,000 K',
-    }],
-  });
-});
-
-test('parseCommandOutput parses where or which output as paths', () => {
-  const parsed = parseCommandOutput({
-    cmd: 'where',
+    cmd: 'which',
     args: ['git'],
-    stdout: 'C:\\Program Files\\Git\\bin\\git.exe\nC:\\Windows\\System32\\git.exe\n',
+    stdout: '/usr/bin/git\n/usr/local/bin/git\n',
   });
 
   assert.deepEqual(parsed, {
     paths: [
-      'C:\\Program Files\\Git\\bin\\git.exe',
-      'C:\\Windows\\System32\\git.exe',
+      '/usr/bin/git',
+      '/usr/local/bin/git',
     ],
   });
 });
@@ -509,17 +482,7 @@ test('summarizeCommandOutput summarizes git remote -v', () => {
   assert.deepEqual(summary, { remoteCount: 2, names: ['origin', 'upstream'] });
 });
 
-test('summarizeCommandOutput summarizes tasklist', () => {
-  const summary = summarizeCommandOutput({
-    cmd: 'tasklist',
-    args: ['/fo', 'csv', '/nh'],
-    parsed: { processes: [{ imageName: 'node.exe', pid: 1 }] },
-  });
-
-  assert.deepEqual(summary, { processCount: 1 });
-});
-
-test('summarizeCommandOutput summarizes where/which', () => {
+test('summarizeCommandOutput summarizes which', () => {
   const summary = summarizeCommandOutput({
     cmd: 'which',
     args: ['node'],

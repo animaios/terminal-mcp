@@ -68,10 +68,9 @@ test('runCommand stops when maxOutputBytes is exceeded', async () => {
 });
 
 test('runCommand can omit raw output when parseOnly is enabled', async () => {
-  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
   const result = await runCommand({
-    cmd: lookupCommand,
-    args: [lookupCommand],
+    cmd: 'which',
+    args: ['which'],
     parse: false,
     parseOnly: true,
   });
@@ -83,10 +82,9 @@ test('runCommand can omit raw output when parseOnly is enabled', async () => {
 });
 
 test('runCommand can return concise summaries for supported commands', async () => {
-  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
   const result = await runCommand({
-    cmd: lookupCommand,
-    args: [lookupCommand],
+    cmd: 'which',
+    args: ['which'],
     parse: false,
     summary: true,
   });
@@ -204,75 +202,15 @@ test('runCommand keeps raw output when summary mode has no supported parser', as
   assert.equal(result.stdout.summary, undefined);
 });
 
-test('runCommand resolves .cmd wrappers from PATH on Windows', async (t) => {
-  if (process.platform !== 'win32') {
-    t.skip('Windows-only behavior');
-    return;
-  }
-
-  const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
-  const originalPath = process.env.PATH;
-  const originalPathExt = process.env.PATHEXT;
-
-  try {
-    await writeFile(join(tempDir, 'echo-wrapper.cmd'), '@echo off\r\necho %~1\r\n');
-    process.env.PATH = `${tempDir};${originalPath ?? ''}`;
-    process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
-
-    const result = await runCommand({
-      cmd: 'echo-wrapper',
-      args: ['hello'],
-      parse: false,
-    });
-
-    assert.equal(result.ok, true);
-    assert.equal(result.exitCode, 0);
-    assert.match(result.stdout.raw, /hello/);
-  } finally {
-    process.env.PATH = originalPath;
-    process.env.PATHEXT = originalPathExt;
-    await rm(tempDir, { recursive: true, force: true });
-  }
-});
-
-test('runCommand executes explicit .cmd files on Windows', async (t) => {
-  if (process.platform !== 'win32') {
-    t.skip('Windows-only behavior');
-    return;
-  }
-
-  const tempDir = await mkdtemp(join(tmpdir(), 'smart-terminal-mcp-'));
-
-  try {
-    const scriptPath = join(tempDir, 'args-wrapper.cmd');
-    await writeFile(scriptPath, '@echo off\r\necho [%~1]\r\n');
-
-    const result = await runCommand({
-      cmd: scriptPath,
-      args: ['hello world'],
-      parse: false,
-    });
-
-    assert.equal(result.ok, true);
-    assert.equal(result.exitCode, 0);
-    assert.match(result.stdout.raw, /\[hello world\]/);
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
-});
-
 test('runCommand handles explicit command paths with spaces', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'smart terminal mcp-'));
 
   try {
-    const isWindows = process.platform === 'win32';
-    const scriptPath = join(tempDir, isWindows ? 'space wrapper.cmd' : 'space-wrapper.sh');
-    const scriptBody = isWindows
-      ? '@echo off\r\necho [%~1]\r\n'
-      : '#!/bin/sh\necho "[$1]"\n';
+    const scriptPath = join(tempDir, 'space-wrapper.sh');
+    const scriptBody = '#!/bin/sh\necho "[$1]"\n';
 
     await writeFile(scriptPath, scriptBody);
-    if (!isWindows) await chmod(scriptPath, 0o755);
+    await chmod(scriptPath, 0o755);
 
     const result = await runCommand({
       cmd: scriptPath,

@@ -1,4 +1,5 @@
 # smart-terminal-mcp
+[![CI](https://github.com/pungggi/smart-terminal-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/pungggi/smart-terminal-mcp/actions/workflows/ci.yml)
 [![Smithery](https://img.shields.io/badge/Smithery-smart--terminal-blue)](https://smithery.ai/server/pungggi/smart-terminal)
 [![Official Registry](https://img.shields.io/badge/MCP-Official--Registry-green)](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.pungggi/smart-terminal)
 

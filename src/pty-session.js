@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { platform } from 'node:os';
 import { stripAnsi } from './ansi.js';
 import { compileUserRegex } from './regex-utils.js';
 import { getShellType } from './shell-detector.js';
@@ -15,7 +14,7 @@ export const DEFAULT_HISTORY_FORMAT = 'lines';
 const DEFAULT_WAIT_RETURN_MODE = 'tail';
 const DEFAULT_WAIT_TAIL_LINES = 50;
 
-export function buildSessionEnv(customEnv = {}, platformName = platform()) {
+export function buildSessionEnv(customEnv = {}) {
   const env = {
     ...process.env,
     ...customEnv,
@@ -23,11 +22,8 @@ export function buildSessionEnv(customEnv = {}, platformName = platform()) {
     PAGER: 'cat',
     LESS: '-FRX',
     TERM: 'xterm-256color',
+    DEBIAN_FRONTEND: 'noninteractive',
   };
-
-  if (platformName !== 'win32') {
-    env.DEBIAN_FRONTEND = 'noninteractive';
-  }
 
   return env;
 }
@@ -199,13 +195,6 @@ export class PtySession {
   }
 
   async _initShell() {
-    if (this.shellType === 'powershell') {
-      this.ptydClient.write(this._daemonSessionId, '$ProgressPreference = \'SilentlyContinue\'\r');
-      await this._readUntilIdle(3000, 500);
-    } else if (this.shellType === 'cmd') {
-      this.ptydClient.write(this._daemonSessionId, 'chcp 65001 > nul\r');
-      await this._readUntilIdle(3000, 500);
-    }
     // Clear buffer after init so it doesn't pollute first command output
     this._resetBuffer();
   }
@@ -691,14 +680,7 @@ export class PtySession {
   }
 
   _wrapCommand(command, marker, cwdMarker, preMarker) {
-    switch (this.shellType) {
-      case 'powershell':
-        return `Write-Host "${preMarker}"; ${command}; Write-Host "${marker}_\${LASTEXITCODE}__"; Write-Host "${cwdMarker}$((Get-Location).Path)__"`;
-      case 'cmd':
-        return `echo ${preMarker} & ${command} & echo ${marker}_%ERRORLEVEL%__ & echo ${cwdMarker}%CD%__`;
-      default: // bash/zsh
-        return `echo "${preMarker}"; ${command}; echo "${marker}_$?__"; echo "${cwdMarker}$(pwd)__"`;
-    }
+    return `echo "${preMarker}"; ${command}; echo "${marker}_$?__"; echo "${cwdMarker}$(pwd)__"`;
   }
 
   _resetBuffer() {

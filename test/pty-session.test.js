@@ -17,7 +17,7 @@ function createWaitSession(buffer = '') {
 }
 
 test('buildSessionEnv applies anti-blocking environment defaults', () => {
-  const env = buildSessionEnv({ CUSTOM_ENV: 'yes', GIT_PAGER: 'less' }, 'linux');
+  const env = buildSessionEnv({ CUSTOM_ENV: 'yes', GIT_PAGER: 'less' });
 
   assert.equal(env.CUSTOM_ENV, 'yes');
   assert.equal(env.GIT_PAGER, 'cat');
@@ -27,79 +27,26 @@ test('buildSessionEnv applies anti-blocking environment defaults', () => {
   assert.equal(env.DEBIAN_FRONTEND, 'noninteractive');
 });
 
-test('buildSessionEnv skips noninteractive override on Windows', () => {
-  const env = buildSessionEnv({}, 'win32');
-
-  assert.equal(env.DEBIAN_FRONTEND, undefined);
-});
-
-test('PowerShell wrapper uses safe marker interpolation', () => {
-  const session = createSession();
-  session.shellType = 'powershell';
-
-  const command = session._wrapCommand('echo hi', '__DONE__', '__CWD_', '__PRE__');
-
-  assert.match(command, /__DONE___\$\{LASTEXITCODE\}__/);
-  assert.match(command, /__CWD_\$\(\(Get-Location\)\.Path\)__/);
-});
-
-test('_initShell suppresses PowerShell progress output', async () => {
-  const session = createSession();
-  const writes = [];
-  let resetCalls = 0;
-  session.shellType = 'powershell';
-  session._daemonSessionId = 1;
-  session.ptydClient = { write: (_id, value) => writes.push(value) };
-  session._readUntilIdle = async () => '';
-  session._resetBuffer = () => {
-    resetCalls++;
-  };
-
-  await session._initShell();
-
-  assert.deepEqual(writes, ["$ProgressPreference = 'SilentlyContinue'\r"]);
-  assert.equal(resetCalls, 1);
-});
-
-test('_initShell sets cmd sessions to UTF-8', async () => {
-  const session = createSession();
-  const writes = [];
-  let resetCalls = 0;
-  session.shellType = 'cmd';
-  session._daemonSessionId = 1;
-  session.ptydClient = { write: (_id, value) => writes.push(value) };
-  session._readUntilIdle = async () => '';
-  session._resetBuffer = () => {
-    resetCalls++;
-  };
-
-  await session._initShell();
-
-  assert.deepEqual(writes, ['chcp 65001 > nul\r']);
-  assert.equal(resetCalls, 1);
-});
-
 test('_parseOutput ignores echoed wrapper text and keeps real output', () => {
   const session = createSession();
   const preMarker = '__MCP_PRE_abc__';
   const marker = '__MCP_DONE_xyz__';
   const cwdMarker = '__MCP_CWD_';
   const raw = [
-    `PS C:\\repo> Write-Host "${preMarker}"; echo hi; Write-Host "${marker}_\${LASTEXITCODE}__"`,
-    `>> Write-Host "${cwdMarker}$((Get-Location).Path)__"`,
+    `echo "${preMarker}"; echo hi; echo "${marker}_$?__"; echo "${cwdMarker}$(pwd)__"`,
     preMarker,
     'hi',
     `${marker}_0__`,
-    `${cwdMarker}C:\\repo__`,
-    'PS C:\\repo>',
-  ].join('\r\n');
+    `${cwdMarker}/home/user/repo__`,
+    '$ ',
+  ].join('\n');
 
   const result = session._parseOutput(raw, marker, cwdMarker, preMarker);
 
   assert.deepEqual(result, {
-    output: 'hi\nPS C:\\repo>',
+    output: 'hi\n$',
     exitCode: 0,
-    cwd: 'C:\\repo',
+    cwd: '/home/user/repo',
   });
 });
 
@@ -164,8 +111,8 @@ test('getInfo can return minimal terminal_list metadata', () => {
   session.cwd = 'C:/repo';
   session.alive = true;
   session.busy = false;
-  session.shell = 'pwsh';
-  session.shellType = 'powershell';
+  session.shell = '/bin/bash';
+  session.shellType = 'bash';
   session.cols = 120;
   session.rows = 30;
   session.createdAt = Date.now() - 1000;
@@ -824,18 +771,6 @@ test('_appendToHistory handles partial lines correctly', () => {
   assert.equal(session._history[0], 'prefix-suffix');
   assert.equal(session._history[1], 'second line');
   assert.equal(session._historyPartial, '');
-});
-
-// ── _wrapCommand for cmd ───────────────────────────────────────────────────
-
-test('_wrapCommand uses cmd syntax for cmd shell type', () => {
-  const session = createSession();
-  session.shellType = 'cmd';
-
-  const wrapped = session._wrapCommand('echo hi', '__DONE__', '__CWD_', '__PRE__');
-  assert.match(wrapped, /echo __PRE__/);
-  assert.match(wrapped, /echo __DONE___%ERRORLEVEL%__/);
-  assert.match(wrapped, /echo __CWD_%CD%__/);
 });
 
 // ── _onOutput / _onExit handler behavior ────────────────────────────────────

@@ -124,10 +124,10 @@ test('terminal_start returns compact session metadata', async () => {
       createCalls.push(opts);
       return {
         id: 's1',
-        shell: 'pwsh.exe',
-        shellType: 'powershell',
-        cwd: 'C:/repo',
-        waitForBanner: async () => 'PowerShell 7',
+        shell: '/bin/bash',
+        shellType: 'bash',
+        cwd: '/home/user/repo',
+        waitForBanner: async () => 'user@host:~$',
       };
     },
   };
@@ -137,17 +137,17 @@ test('terminal_start returns compact session metadata', async () => {
   const result = await server.tools.get('terminal_start').handler({
     cols: 140,
     rows: 40,
-    cwd: 'C:/repo',
+    cwd: '/home/user/repo',
     name: 'smc-verify',
   });
 
-  assert.deepEqual(createCalls, [{ cols: 140, rows: 40, cwd: 'C:/repo', name: 'smc-verify', shell: undefined, env: undefined }]);
+  assert.deepEqual(createCalls, [{ cols: 140, rows: 40, cwd: '/home/user/repo', name: 'smc-verify', shell: undefined, env: undefined }]);
   assert.deepEqual(JSON.parse(result.content[0].text), {
     sessionId: 's1',
-    shell: 'pwsh.exe',
-    shellType: 'powershell',
-    cwd: 'C:/repo',
-    banner: 'PowerShell 7',
+    shell: '/bin/bash',
+    shellType: 'bash',
+    cwd: '/home/user/repo',
+    banner: 'user@host:~$',
   });
 });
 
@@ -244,13 +244,12 @@ test('SMART_TERMINAL_DISABLED_TOOLS="" registers all tools normally', () => {
 
 test('terminal_run forwards summary mode for concise output', async () => {
   const server = createFakeServer();
-  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
 
   registerTools(server, {});
 
   const result = await server.tools.get('terminal_run').handler({
-    cmd: lookupCommand,
-    args: [lookupCommand],
+    cmd: 'which',
+    args: ['which'],
     parse: false,
     summary: true,
   });
@@ -345,13 +344,12 @@ test('terminal_run_paged can return summaries for read-only commands', async () 
   process.env.SMART_TERMINAL_DISABLED_TOOLS = '';
   try {
     const server = createFakeServer();
-    const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
 
     registerTools(server, {});
 
     const result = await server.tools.get('terminal_run_paged').handler({
-      cmd: lookupCommand,
-      args: [lookupCommand],
+      cmd: 'which',
+      args: ['which'],
       page: 0,
       pageSize: 5,
       summary: true,
@@ -646,8 +644,6 @@ test('terminal_stop writes transcript to disk', async () => {
 });
 
 test('terminal_stop does not stop session on transcript write failure', async () => {
-  // On Windows, deep path writes often succeed (no permission constraints)
-  // Use a path with a null byte which is universally invalid
   const server = createFakeServer();
   let stopped = false;
   const manager = {
@@ -660,11 +656,7 @@ test('terminal_stop does not stop session on transcript write failure', async ()
   registerTools(server, manager);
 
   // Using a path that resolves to something that will fail on write
-  // On Unix: /dev/null/impossible/output.log (ENOTDIR)
-  // On Windows: NUL\impossible (still writable sometimes)
-  // Instead, skip on Windows
-  if (process.platform === 'win32') return;
-
+  // /dev/null/impossible/output.log triggers ENOTDIR
   const result = await server.tools.get('terminal_stop').handler({
     sessionId: 's1',
     transcriptPath: '/dev/null/impossible/output.log',

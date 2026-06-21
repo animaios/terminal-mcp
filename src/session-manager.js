@@ -1,6 +1,5 @@
 import { stat } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
-import { platform } from 'node:os';
 import { PtySession } from './pty-session.js';
 import { detectShell, isAvailable } from './shell-detector.js';
 import { generateSessionId } from './session-id.js';
@@ -129,24 +128,13 @@ export class SessionManager {
   }
 }
 
-const WINDOWS_SHELL_EXTENSIONS = ['.exe', '.cmd', '.bat'];
-
 /**
  * Validate and resolve a user-provided shell name.
- * On Windows, tries appending common extensions if the bare name isn't found.
  * @param {string} shell
  * @returns {string} The resolved shell name
  */
 function resolveUserShell(shell) {
   if (isAvailable(shell)) return shell;
-
-  // On Windows, try appending .exe etc. so "pwsh" resolves to "pwsh.exe"
-  if (platform() === 'win32' && !shell.includes('.')) {
-    for (const ext of WINDOWS_SHELL_EXTENSIONS) {
-      const candidate = `${shell}${ext}`;
-      if (isAvailable(candidate)) return candidate;
-    }
-  }
 
   const detected = detectShell();
   throw new Error(

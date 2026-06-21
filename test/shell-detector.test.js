@@ -4,22 +4,7 @@ import { getShellType, isAvailable, detectShell } from '../src/shell-detector.js
 
 // ── getShellType ────────────────────────────────────────────────────────────
 
-test('getShellType identifies PowerShell variants', () => {
-  assert.equal(getShellType('pwsh'), 'powershell');
-  assert.equal(getShellType('pwsh.exe'), 'powershell');
-  assert.equal(getShellType('/usr/bin/pwsh'), 'powershell');
-  assert.equal(getShellType('powershell'), 'powershell');
-  assert.equal(getShellType('powershell.exe'), 'powershell');
-  assert.equal(getShellType('PowerShell'), 'powershell');
-});
-
-test('getShellType identifies cmd', () => {
-  assert.equal(getShellType('cmd'), 'cmd');
-  assert.equal(getShellType('cmd.exe'), 'cmd');
-  assert.equal(getShellType('CMD'), 'cmd');
-});
-
-test('getShellType defaults to bash for unknown shells', () => {
+test('getShellType always returns bash', () => {
   assert.equal(getShellType('/bin/bash'), 'bash');
   assert.equal(getShellType('/bin/zsh'), 'bash');
   assert.equal(getShellType('sh'), 'bash');
@@ -46,7 +31,7 @@ test('detectShell returns a shell and args object', () => {
   assert.ok(result.shell.length > 0);
 });
 
-test('detectShell falls back to bash or sh when SHELL is unset on Unix', { skip: process.platform === 'win32' }, () => {
+test('detectShell falls back to bash or sh when SHELL is unset', () => {
   const origShell = process.env.SHELL;
   try {
     delete process.env.SHELL;
@@ -59,7 +44,7 @@ test('detectShell falls back to bash or sh when SHELL is unset on Unix', { skip:
   }
 });
 
-test('detectShell uses SHELL env var on Unix', { skip: process.platform === 'win32' }, () => {
+test('detectShell uses SHELL env var', () => {
   const origShell = process.env.SHELL;
   try {
     process.env.SHELL = '/bin/zsh';

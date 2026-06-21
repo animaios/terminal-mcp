@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { statSync } from 'node:fs';
-import { delimiter, extname, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { resolve as resolvePath } from 'node:path';
 import { normalizeCommandName, parseCommandOutput, summarizeCommandOutput } from './command-parsers.js';
 import { compileUserRegex } from './regex-utils.js';
 
@@ -9,10 +9,8 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_OUTPUT_BYTES = 100 * 1024;
 const STRUCTURED_PARSER_HINT = 'Structured parser unavailable for this command signature. If you need this often, propose one.';
 const PARSER_HINT_MIN_STDOUT_BYTES = 200;
-const PARSER_HINT_COMMANDS = new Set(['where', 'which']);
+const PARSER_HINT_COMMANDS = new Set(['which']);
 const PARSER_HINT_GIT_SUBCOMMANDS = new Set(['branch', 'diff', 'log', 'remote', 'rev-parse', 'status']);
-const DEFAULT_WINDOWS_PATH_EXTENSIONS = ['.com', '.exe', '.bat', '.cmd'];
-const WINDOWS_BATCH_EXTENSIONS = new Set(['.bat', '.cmd']);
 
 export async function runCommand({
   cmd,
@@ -44,8 +42,6 @@ export async function runCommand({
     const child = spawn(spawnPlan.command, spawnPlan.args, {
       cwd: resolvedCwd,
       shell: spawnPlan.shell ?? false,
-      windowsHide: true,
-      windowsVerbatimArguments: spawnPlan.windowsVerbatimArguments,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -224,165 +220,16 @@ function formatFileCheckError(error) {
 }
 
 function buildSpawnPlan({ cmd, args, cwd, useShell = false }) {
-  if (useShell) {
-    return {
-      command: cmd,
-      args,
-      shell: true,
-      windowsVerbatimArguments: false,
-    };
-  }
-
-  if (process.platform !== 'win32') {
-    return {
-      command: cmd,
-      args,
-      windowsVerbatimArguments: false,
-    };
-  }
-
-  const resolvedCommand = resolveWindowsCommand(cmd, cwd);
-
-  // When the caller explicitly invokes cmd.exe with /c (e.g. for shell
-  // built-ins like `for /f`), join the trailing args into a single verbatim
-  // command string so cmd.exe interprets them correctly.
-  if (isExplicitCmdExeCall(resolvedCommand ?? cmd, args)) {
-    return buildCmdExePlan(args);
-  }
-
-  if (!resolvedCommand || !isWindowsBatchCommand(resolvedCommand)) {
-    return {
-      command: resolvedCommand ?? cmd,
-      args,
-      windowsVerbatimArguments: false,
-    };
-  }
-
   return {
-    command: process.env.ComSpec || 'cmd.exe',
-    args: ['/d', '/s', '/c', formatWindowsBatchCommand(resolvedCommand, args)],
-    windowsVerbatimArguments: true,
+    command: cmd,
+    args,
+    shell: useShell || false,
   };
-}
-
-function isExplicitCmdExeCall(resolved, args) {
-  const comSpec = (process.env.ComSpec || 'cmd.exe').toLowerCase();
-  const name = resolved.toLowerCase();
-  if (name !== comSpec && name !== 'cmd' && name !== 'cmd.exe') return false;
-  return args.some((a) => a.toLowerCase() === '/c');
-}
-
-function buildCmdExePlan(args) {
-  const comSpec = process.env.ComSpec || 'cmd.exe';
-
-  // Collect any flags before /c (e.g. /d, /s) and the command body after /c.
-  const prefixFlags = [];
-  let commandBody = '';
-  let foundSlashC = false;
-  for (let i = 0; i < args.length; i++) {
-    if (!foundSlashC && args[i].toLowerCase() === '/c') {
-      foundSlashC = true;
-      // Everything after /c is the shell command – join into one string.
-      commandBody = args.slice(i + 1).join(' ');
-      break;
-    }
-    prefixFlags.push(args[i]);
-  }
-
-  return {
-    command: comSpec,
-    args: [...prefixFlags, '/s', '/c', `"${commandBody}"`],
-    windowsVerbatimArguments: true,
-  };
-}
-
-function resolveWindowsCommand(cmd, cwd) {
-  const pathExts = getWindowsPathExtensions();
-  if (looksLikePath(cmd)) {
-    return findExistingCommandPath(buildPathCandidates(resolveWindowsPath(cmd, cwd), pathExts));
-  }
-
-  return findCommandOnPath(buildCommandCandidates(cmd, pathExts));
-}
-
-function getWindowsPathExtensions() {
-  const rawPathExt = process.env.PATHEXT;
-  if (!rawPathExt) return DEFAULT_WINDOWS_PATH_EXTENSIONS;
-
-  const pathExts = rawPathExt
-    .split(';')
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
-
-  return pathExts.length > 0 ? pathExts : DEFAULT_WINDOWS_PATH_EXTENSIONS;
-}
-
-function buildPathCandidates(commandPath, pathExts) {
-  if (extname(commandPath)) return [commandPath];
-  return [...pathExts.map((pathExt) => `${commandPath}${pathExt}`), commandPath];
-}
-
-function buildCommandCandidates(cmd, pathExts) {
-  if (extname(cmd)) return [cmd];
-  return [...pathExts.map((pathExt) => `${cmd}${pathExt}`), cmd];
-}
-
-function findCommandOnPath(candidates) {
-  const rawPath = process.env.PATH ?? '';
-  const pathDirs = rawPath.split(delimiter).map((value) => value.trim()).filter(Boolean);
-  for (const pathDir of pathDirs) {
-    for (const candidate of candidates) {
-      const resolvedPath = join(pathDir, candidate);
-      if (isExistingFile(resolvedPath)) return resolvedPath;
-    }
-  }
-
-  return null;
-}
-
-function findExistingCommandPath(candidates) {
-  for (const candidate of candidates) {
-    if (isExistingFile(candidate)) return candidate;
-  }
-
-  return null;
-}
-
-function resolveWindowsPath(cmd, cwd) {
-  if (isAbsolute(cmd)) return cmd;
-  return resolvePath(cwd, cmd);
-}
-
-function looksLikePath(cmd) {
-  return cmd.includes('\\') || cmd.includes('/') || cmd.startsWith('.');
-}
-
-function isExistingFile(filePath) {
-  try {
-    return statSync(filePath).isFile();
-  } catch {
-    return false;
-  }
-}
-
-function isWindowsBatchCommand(cmd) {
-  return WINDOWS_BATCH_EXTENSIONS.has(extname(cmd).toLowerCase());
-}
-
-function formatWindowsBatchCommand(command, args) {
-  const parts = [quoteWindowsBatchArgument(command), ...args.map(quoteWindowsBatchArgument)];
-  return `"${parts.join(' ')}"`;
-}
-
-function quoteWindowsBatchArgument(value) {
-  const stringValue = String(value);
-  if (stringValue.length === 0) return '""';
-  return `"${stringValue.replace(/(["%^&|<>!()])/g, '^$1')}"`;
 }
 
 function formatStartError({ cmd, err }) {
   const baseMessage = `Failed to start command "${cmd}": ${err.message}`;
-  if (err?.code !== 'ENOENT' || looksLikePath(cmd)) {
+  if (err?.code !== 'ENOENT' || cmd.includes('/') || cmd.startsWith('.')) {
     return baseMessage;
   }
 

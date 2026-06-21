@@ -1,8 +1,7 @@
 import { basename } from 'node:path';
 
 export function normalizeCommandName(cmd) {
-  const name = basename(cmd || '').toLowerCase();
-  return name.endsWith('.exe') ? name.slice(0, -4) : name;
+  return basename(cmd || '').toLowerCase();
 }
 
 export function parseCommandOutput({ cmd, args = [], stdout }) {
@@ -10,8 +9,7 @@ export function parseCommandOutput({ cmd, args = [], stdout }) {
 
   const name = normalizeCommandName(cmd);
   if (name === 'git') return parseGitCommandOutput(args, stdout);
-  if (name === 'tasklist' && isTasklistCsv(args)) return parseTasklistCsv(stdout);
-  if ((name === 'where' || name === 'which') && args.length > 0) return parsePathList(stdout);
+  if (name === 'which' && args.length > 0) return parsePathList(stdout);
   return null;
 }
 
@@ -20,10 +18,7 @@ export function summarizeCommandOutput({ cmd, args = [], parsed }) {
 
   const name = normalizeCommandName(cmd);
   if (name === 'git') return summarizeGitCommandOutput(args, parsed);
-  if (name === 'tasklist' && Array.isArray(parsed.processes)) {
-    return { processCount: parsed.processes.length };
-  }
-  if ((name === 'where' || name === 'which') && Array.isArray(parsed.paths)) {
+  if (name === 'which' && Array.isArray(parsed.paths)) {
     return { pathCount: parsed.paths.length };
   }
 
@@ -157,9 +152,9 @@ function isGitLsFiles(args) {
   return args[0] === 'ls-files' && args.slice(1).every((arg) => arg.startsWith('-'));
 }
 
-function isTasklistCsv(args) {
-  const lowerArgs = args.map((arg) => arg.toLowerCase());
-  return lowerArgs.length === 3 && lowerArgs[0] === '/fo' && lowerArgs[1] === 'csv' && lowerArgs[2] === '/nh';
+function parsePathList(stdout) {
+  const paths = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return paths.length > 0 ? { paths } : null;
 }
 
 function parseGitLogOneline(stdout) {
@@ -470,39 +465,4 @@ function isGitBranchListArg(arg) {
 
 function isGitBranchVerboseArg(arg) {
   return ['-v', '-vv', '--verbose'].includes(arg.toLowerCase());
-}
-
-function parseTasklistCsv(stdout) {
-  const processes = stdout
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map(parseTasklistCsvLine)
-    .filter(Boolean);
-
-  return processes.length > 0 ? { processes } : null;
-}
-
-function parseTasklistCsvLine(line) {
-  if (!line.startsWith('"') || !line.endsWith('"')) return null;
-
-  const [imageName, pidValue, sessionName, sessionNumberValue, memUsage] = line.slice(1, -1).split('","');
-  if (!imageName || !pidValue) return null;
-
-  return {
-    imageName,
-    pid: toNumberOrRaw(pidValue),
-    sessionName,
-    sessionNumber: toNumberOrRaw(sessionNumberValue),
-    memUsage,
-  };
-}
-
-function parsePathList(stdout) {
-  const paths = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  return paths.length > 0 ? { paths } : null;
-}
-
-function toNumberOrRaw(value) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isNaN(parsed) ? value : parsed;
 }
