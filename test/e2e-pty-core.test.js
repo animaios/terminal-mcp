@@ -702,7 +702,7 @@ if (process.platform === "win32") {
       await session.exec({ command: "echo history-line-1", timeout: 5000 });
       await session.exec({ command: "echo history-line-2", timeout: 5000 });
 
-      const history = session.getHistory();
+      const history = session.getHistory({ format: "text" });
       const text = history.text;
       assert.ok(
         text.includes("history-line-1"),
@@ -734,7 +734,7 @@ if (process.platform === "win32") {
         await session.exec({ command: `echo slice-line-${i}`, timeout: 5000 });
       }
 
-      const full = session.getHistory();
+      const full = session.getHistory({ format: "text" });
       assert.ok(
         full.totalLines > 2,
         `need lines for slice test, got ${full.totalLines}`,
@@ -742,7 +742,11 @@ if (process.platform === "win32") {
 
       // Use offset and limit based on what's available
       if (full.totalLines > 3) {
-        const sliced = session.getHistory({ offset: 0, limit: 2 });
+        const sliced = session.getHistory({
+          offset: 0,
+          limit: 2,
+          format: "text",
+        });
         assert.ok(
           sliced.text.length > 0 || sliced.lineCount >= 0,
           "slice should have some content",

@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const SOCKET = "/tmp/ptyd-1000.sock";
 const BINARY = "./build/ptyd";
+const DAEMON_CWD = "/home/vi/terminal-mcp/ptyd";
 
 let id = 0;
 function nextId() {
@@ -69,7 +70,7 @@ async function run() {
   // Start daemon
   const daemon = spawn(BINARY, [], {
     stdio: "pipe",
-    cwd: "/home/vi/smart-terminal-mcp/ptyd",
+    cwd: DAEMON_CWD,
   });
   daemon.stdout.on("data", (d) => console.log("[ptyd]", d.toString().trim()));
   daemon.stderr.on("data", (d) => console.log("[ptyd]", d.toString().trim()));

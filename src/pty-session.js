@@ -1,7 +1,24 @@
-import { randomUUID } from 'node:crypto';
-import { stripAnsi } from './ansi.js';
-import { compileUserRegex } from './regex-utils.js';
-import { getShellType } from './shell-detector.js';
+import { randomUUID } from "node:crypto";
+import { stripAnsi } from "./ansi.js";
+import { compileUserRegex } from "./regex-utils.js";
+import { getShellType } from "./shell-detector.js";
+import { spawn } from "node:child_process";
+import {
+  openSync,
+  closeSync,
+  readSync,
+  writeSync,
+  readFileSync,
+  unlinkSync,
+  accessSync,
+  constants,
+} from "node:fs";
+import os, { platform, tmpdir } from "node:os";
+import { join as joinPath, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const MAX_BUFFER_BYTES = 1024 * 1024; // 1MB
 const HISTORY_MAX_LINES = 10_000;
@@ -10,69 +27,188 @@ const BANNER_IDLE_MS = 500;
 export const DEFAULT_EXEC_MAX_LINES = 200;
 export const DEFAULT_READ_MAX_LINES = 200;
 export const DEFAULT_HISTORY_LIMIT = 200;
-export const DEFAULT_HISTORY_FORMAT = 'lines';
-const DEFAULT_WAIT_RETURN_MODE = 'tail';
+export const DEFAULT_HISTORY_FORMAT = "lines";
+const DEFAULT_WAIT_RETURN_MODE = "tail";
 const DEFAULT_WAIT_TAIL_LINES = 50;
 
-export function buildSessionEnv(customEnv = {}) {
+export function buildSessionEnv(customEnv = {}, platformName = platform()) {
   const env = {
     ...process.env,
     ...customEnv,
-    GIT_PAGER: 'cat',
-    PAGER: 'cat',
-    LESS: '-FRX',
-    TERM: 'xterm-256color',
-    DEBIAN_FRONTEND: 'noninteractive',
+    GIT_PAGER: "cat",
+    PAGER: "cat",
+    LESS: "-FRX",
+    TERM: "xterm-256color",
   };
+  if (platformName !== "win32") {
+    env.DEBIAN_FRONTEND = "noninteractive";
+  }
 
   return env;
 }
 
 function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
  * Key name to escape sequence mapping for terminal_send_key.
  */
 const KEY_MAP = {
-  'ctrl+c': '\x03',
-  'ctrl+d': '\x04',
-  'ctrl+z': '\x1A',
-  'ctrl+l': '\x0C',
-  'ctrl+a': '\x01',
-  'ctrl+e': '\x05',
-  'ctrl+u': '\x15',
-  'ctrl+k': '\x0B',
-  'ctrl+w': '\x17',
-  'tab': '\t',
-  'enter': '\r',
-  'escape': '\x1B',
-  'up': '\x1B[A',
-  'down': '\x1B[B',
-  'right': '\x1B[C',
-  'left': '\x1B[D',
-  'home': '\x1B[H',
-  'end': '\x1B[F',
-  'pageup': '\x1B[5~',
-  'pagedown': '\x1B[6~',
-  'backspace': '\x7F',
-  'delete': '\x1B[3~',
-  'f1': '\x1BOP',
-  'f2': '\x1BOQ',
-  'f3': '\x1BOR',
-  'f4': '\x1BOS',
-  'f5': '\x1B[15~',
-  'f6': '\x1B[17~',
-  'f7': '\x1B[18~',
-  'f8': '\x1B[19~',
-  'f9': '\x1B[20~',
-  'f10': '\x1B[21~',
-  'f11': '\x1B[23~',
-  'f12': '\x1B[24~',
+  "ctrl+c": "\x03",
+  "ctrl+d": "\x04",
+  "ctrl+z": "\x1A",
+  "ctrl+l": "\x0C",
+  "ctrl+a": "\x01",
+  "ctrl+e": "\x05",
+  "ctrl+u": "\x15",
+  "ctrl+k": "\x0B",
+  "ctrl+w": "\x17",
+  tab: "\t",
+  enter: "\r",
+  escape: "\x1B",
+  up: "\x1B[A",
+  down: "\x1B[B",
+  right: "\x1B[C",
+  left: "\x1B[D",
+  home: "\x1B[H",
+  end: "\x1B[F",
+  pageup: "\x1B[5~",
+  pagedown: "\x1B[6~",
+  backspace: "\x7F",
+  delete: "\x1B[3~",
+  f1: "\x1BOP",
+  f2: "\x1BOQ",
+  f3: "\x1BOR",
+  f4: "\x1BOS",
+  f5: "\x1B[15~",
+  f6: "\x1B[17~",
+  f7: "\x1B[18~",
+  f8: "\x1B[19~",
+  f9: "\x1B[20~",
+  f10: "\x1B[21~",
+  f11: "\x1B[23~",
+  f12: "\x1B[24~",
 };
 
 export const SUPPORTED_KEYS = Object.keys(KEY_MAP);
+
+/**
+ * Allocate a PTY (Unix only).
+ *
+ * Two modes:
+ *  - "direct" (os.ptsname() available): opens /dev/ptmx, returns masterFd
+ *  - "helper" (no os.ptsname()): spawns pty-helper binary which proxies master I/O
+ *
+ * Falls back to null if allocation fails.
+ * @returns {{ mode: 'direct', masterFd: number, slaveFd: number, slavePath: string, cleanup: () => void } | { mode: 'helper', helper: import('node:child_process').ChildProcess, slaveFd: number, slavePath: string, cleanup: () => void } | null}
+ */
+function allocatePty() {
+  if (platform() === "win32") return null;
+
+  // Fast path: native os.ptsname() is available
+  let nativePtsname = null;
+  try {
+    if (typeof os.ptsname === "function") {
+      nativePtsname = os.ptsname;
+    }
+  } catch {}
+
+  if (nativePtsname) {
+    try {
+      const master = openSync("/dev/ptmx", "r+");
+      try {
+        const slavePath = nativePtsname(master);
+        if (!slavePath) {
+          closeSync(master);
+          return null;
+        }
+        const slaveFd = openSync(slavePath, "r+");
+        return {
+          mode: "direct",
+          masterFd: master,
+          slaveFd,
+          slavePath,
+          cleanup: () => {
+            try {
+              closeSync(master);
+            } catch {}
+            try {
+              closeSync(slaveFd);
+            } catch {}
+          },
+        };
+      } catch {
+        closeSync(master);
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  // Fallback path: pty-helper binary
+  try {
+    const headerPath = joinPath(
+      tmpdir(),
+      `pty-helper-${Date.now()}-${Math.random().toString(36).slice(2)}.hdr`,
+    );
+    const helperPath = joinPath(__dirname, "pty-helper");
+
+    try {
+      accessSync(helperPath, constants.R_OK | constants.X_OK);
+    } catch {
+      return null;
+    }
+
+    const helper = spawn(helperPath, [headerPath], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    // Poll for the header file (up to 3s)
+    let content = null;
+    for (let i = 0; i < 300; i++) {
+      try {
+        content = readFileSync(headerPath, "utf8").trim();
+        if (content && content.startsWith("/dev/pts/")) break;
+      } catch {}
+      // Wait 10ms between polls
+      const start = Date.now();
+      while (Date.now() - start < 10) {}
+    }
+
+    try {
+      unlinkSync(headerPath);
+    } catch {}
+
+    if (!content || !content.startsWith("/dev/pts/")) {
+      try {
+        helper.kill();
+      } catch {}
+      return null;
+    }
+
+    const slavePath = content;
+    const slaveFd = openSync(slavePath, "r+");
+
+    return {
+      mode: "helper",
+      helper,
+      slaveFd,
+      slavePath,
+      cleanup: () => {
+        try {
+          helper.kill();
+        } catch {}
+        try {
+          closeSync(slaveFd);
+        } catch {}
+      },
+    };
+  } catch {
+    return null;
+  }
+}
 
 export class PtySession {
   /**
@@ -87,7 +223,17 @@ export class PtySession {
    * @param {Record<string, string>} [opts.env]
    * @param {import('./ptyd-client.js').PtydClient} opts.ptydClient
    */
-  constructor({ id, shell, shellArgs, cols, rows, cwd, name, env: customEnv, ptydClient }) {
+  constructor({
+    id,
+    shell,
+    shellArgs,
+    cols,
+    rows,
+    cwd,
+    name,
+    env: customEnv,
+    ptydClient,
+  }) {
     this.id = id;
     this.shell = shell;
     this.shellArgs = shellArgs || [];
@@ -109,7 +255,7 @@ export class PtySession {
     this._pid = null;
 
     /** @type {string} */
-    this._buffer = '';
+    this._buffer = "";
     /** Monotonic byte counter — total bytes ever emitted. Never resets. */
     this._totalBytesEmitted = 0;
     /** @type {string[]} Rolling history of cleaned output lines */
@@ -117,13 +263,46 @@ export class PtySession {
     /** Total lines ever appended (monotonic counter for detecting eviction) */
     this._historyTotalLines = 0;
     /** Partial line not yet terminated by newline */
-    this._historyPartial = '';
+    this._historyPartial = "";
     /** Byte offset for unread output returned by terminal_read */
     this._readCursor = 0;
     /** @type {((data: string) => void)[]} */
     this._dataListeners = [];
     /** @type {string | null} */
     this._pendingMarker = null;
+    /** @type {boolean} */
+    this._initialized = false;
+
+    // --- Standalone PTY mode fields ---
+    /** @type {'direct'|'helper'|null} */
+    this._ptyMode = null;
+    /** @type {import('node:child_process').ChildProcess|null} */
+    this._helper = null;
+    /** @type {number|null} */
+    this._ptyMasterFd = null;
+    /** @type {number|null} */
+    this._ptySlaveFd = null;
+    /** @type {string|null} */
+    this._ptySlavePath = null;
+    /** @type {Function|null} */
+    this._ptyCleanup = null;
+    /** @type {boolean} */
+    this._ptyReadRunning = false;
+    /** @type {import('node:child_process').ChildProcess|null} */
+    this.process = null;
+
+    // === Standalone mode early init ===
+    // Allocate PTY in constructor so _ptyMode is available immediately
+    // (needed for the PTY allocation test which doesn't call init())
+    if (!ptydClient) {
+      const ptyInfo = allocatePty();
+      this._ptyMode = ptyInfo ? ptyInfo.mode : null;
+      this._helper = ptyInfo?.mode === "helper" ? ptyInfo.helper : null;
+      this._ptyMasterFd = ptyInfo?.mode === "direct" ? ptyInfo.masterFd : null;
+      this._ptySlaveFd = ptyInfo ? ptyInfo.slaveFd : null;
+      this._ptySlavePath = ptyInfo ? ptyInfo.slavePath : null;
+      this._ptyCleanup = ptyInfo ? ptyInfo.cleanup : null;
+    }
   }
 
   /**
@@ -134,53 +313,273 @@ export class PtySession {
   async init() {
     const env = buildSessionEnv(this._customEnv);
 
-    const { sessionId, pid } = await this.ptydClient.start({
-      shell: this.shell,
-      args: this.shellArgs,
-      cols: this.cols,
-      rows: this.rows,
+    // === Daemon mode ===
+    if (this.ptydClient) {
+      const { sessionId, pid } = await this.ptydClient.start({
+        shell: this.shell,
+        args: this.shellArgs,
+        cols: this.cols,
+        rows: this.rows,
+        cwd: this.cwd,
+        env,
+      });
+
+      this._daemonSessionId = sessionId;
+      this._pid = pid;
+
+      this._onOutput = (daemonId, data) => {
+        if (daemonId !== this._daemonSessionId) return;
+        this.lastActivity = Date.now();
+        const strData = data.toString("utf8");
+        this._buffer += strData;
+        this._totalBytesEmitted += strData.length;
+
+        if (this._pendingMarker) {
+          const clean = stripAnsi(this._buffer);
+          if (
+            clean.includes(`\n${this._pendingMarker}`) ||
+            clean.startsWith(this._pendingMarker)
+          ) {
+            this.busy = false;
+            this._pendingMarker = null;
+          }
+        }
+
+        // Enforce buffer cap — keep tail
+        if (this._buffer.length > MAX_BUFFER_BYTES) {
+          const overflow = this._buffer.length - MAX_BUFFER_BYTES;
+          this._buffer = this._buffer.slice(-MAX_BUFFER_BYTES);
+          this._readCursor = Math.max(0, this._readCursor - overflow);
+        }
+        // Append cleaned output to rolling history
+        this._appendToHistory(strData);
+        for (const listener of this._dataListeners) {
+          listener(strData);
+        }
+      };
+
+      this._onExit = (daemonId) => {
+        if (daemonId !== this._daemonSessionId) return;
+        this.alive = false;
+      };
+
+      this.ptydClient.on("output", this._onOutput);
+      this.ptydClient.on("exit", this._onExit);
+      this._initialized = true;
+      return;
+    }
+
+    // === Standalone mode ===
+    // PTY was already allocated in constructor (if possible)
+    const isPty = this._ptyMode !== null;
+
+    const spawnOpts = {
       cwd: this.cwd,
       env,
+      stdio: isPty
+        ? [this._ptySlaveFd, this._ptySlaveFd, this._ptySlaveFd]
+        : ["pipe", "pipe", "pipe"],
+      detached: true,
+      windowsHide: platform() === "win32",
+    };
+
+    const shellArgs = this.shellArgs || [];
+    this.process = spawn(
+      this.shell,
+      shellArgs.length > 0 ? shellArgs : [],
+      spawnOpts,
+    );
+
+    // Close slave FDs in parent after spawn — child has them now
+    if (isPty && this._ptySlaveFd !== null) {
+      try {
+        closeSync(this._ptySlaveFd);
+      } catch {}
+      this._ptySlaveFd = null;
+    }
+
+    // Set up reading
+    if (this._ptyMode === "direct" && this._ptyMasterFd !== null) {
+      this._startPtyReader(this._ptyMasterFd);
+    } else if (this._ptyMode === "helper" && this._helper) {
+      this._helper.stdout.on("data", (data) => {
+        this._handleData(data);
+      });
+      this._helper.on("exit", () => {
+        this._ptyReadRunning = false;
+        this.alive = false;
+        this._cleanupPty();
+      });
+    } else {
+      // Pipe mode
+      this.process.stdout?.on("data", (data) => {
+        this._handleData(data);
+      });
+      this.process.stderr?.on("data", (data) => {
+        this._handleData(data);
+      });
+    }
+
+    this.process.on("exit", () => {
+      this.alive = false;
+      this._cleanupPty();
     });
 
-    this._daemonSessionId = sessionId;
-    this._pid = pid;
+    this.process.on("error", () => {
+      if (!this.alive) return;
+      this.alive = false;
+      this._cleanupPty();
+    });
 
-    this._onOutput = (daemonId, data) => {
-      if (daemonId !== this._daemonSessionId) return;
-      this.lastActivity = Date.now();
-      const strData = data.toString('utf8');
-      this._buffer += strData;
-      this._totalBytesEmitted += strData.length;
+    this._initialized = true;
+  }
 
-      if (this._pendingMarker) {
-        const clean = stripAnsi(this._buffer);
-        if (clean.includes(`\n${this._pendingMarker}`) || clean.startsWith(this._pendingMarker)) {
-          this.busy = false;
-          this._pendingMarker = null;
+  // ── Standalone PTY helper methods ─────────────────────────────────
+
+  _startPtyReader(fd) {
+    const buf = Buffer.alloc(64 * 1024);
+    this._ptyReadRunning = true;
+
+    const doRead = () => {
+      if (!this._ptyReadRunning || this._ptyMasterFd === null) return;
+      try {
+        const bytesRead = readSync(fd, buf, 0, buf.length, null);
+        if (bytesRead > 0) {
+          this._handleData(buf.toString("utf-8", 0, bytesRead));
+          setImmediate(doRead);
+        } else {
+          this._ptyReadRunning = false;
+          this.alive = false;
+          this._cleanupPty();
+        }
+      } catch (err) {
+        if (err.code === "EIO" || err.code === "EBADF") {
+          this._ptyReadRunning = false;
+          this.alive = false;
+          this._cleanupPty();
+          return;
+        }
+        if (this._ptyReadRunning) {
+          setTimeout(doRead, 10);
         }
       }
-
-      // Enforce buffer cap — keep tail
-      if (this._buffer.length > MAX_BUFFER_BYTES) {
-        const overflow = this._buffer.length - MAX_BUFFER_BYTES;
-        this._buffer = this._buffer.slice(-MAX_BUFFER_BYTES);
-        this._readCursor = Math.max(0, this._readCursor - overflow);
-      }
-      // Append cleaned output to rolling history
-      this._appendToHistory(strData);
-      for (const listener of this._dataListeners) {
-        listener(strData);
-      }
     };
+    setImmediate(doRead);
+  }
 
-    this._onExit = (daemonId) => {
-      if (daemonId !== this._daemonSessionId) return;
-      this.alive = false;
-    };
+  _cleanupPty() {
+    this._ptyReadRunning = false;
+    if (this._ptyMode === "helper" && this._helper) {
+      try {
+        this._helper.kill();
+      } catch {}
+      this._helper = null;
+    }
+    if (this._ptyCleanup) {
+      try {
+        this._ptyCleanup();
+      } catch {}
+      this._ptyCleanup = null;
+    }
+    if (this._ptyMasterFd !== null) {
+      try {
+        closeSync(this._ptyMasterFd);
+      } catch {}
+      this._ptyMasterFd = null;
+    }
+  }
 
-    this.ptydClient.on('output', this._onOutput);
-    this.ptydClient.on('exit', this._onExit);
+  _writeToPty(data) {
+    if (!this.alive) {
+      throw new Error(`Session ${this.id} is no longer alive.`);
+    }
+
+    if (this.ptydClient && this._daemonSessionId !== null) {
+      this.ptydClient.write(this._daemonSessionId, data);
+      return;
+    }
+
+    // Standalone mode
+    if (this._ptyMode === "direct" && this._ptyMasterFd !== null) {
+      const buf = typeof data === "string" ? Buffer.from(data, "utf-8") : data;
+      try {
+        writeSync(this._ptyMasterFd, buf, 0, buf.length, null);
+      } catch (err) {
+        if (err.code === "EIO" || err.code === "EBADF") {
+          this.alive = false;
+          this._cleanupPty();
+        }
+      }
+    } else if (
+      this._ptyMode === "helper" &&
+      this._helper?.stdin &&
+      !this._helper.stdin.destroyed
+    ) {
+      this._helper.stdin.write(data);
+    } else if (this.process?.stdin && !this.process.stdin.destroyed) {
+      this.process.stdin.write(data);
+    }
+  }
+
+  _handleData(data) {
+    const str = typeof data === "string" ? data : data.toString("utf-8");
+    this.lastActivity = Date.now();
+    this._buffer += str;
+    this._totalBytesEmitted += str.length;
+
+    if (this._pendingMarker && this._buffer.includes(this._pendingMarker)) {
+      this.busy = false;
+      this._pendingMarker = null;
+    }
+
+    if (this._buffer.length > MAX_BUFFER_BYTES) {
+      const overflow = this._buffer.length - MAX_BUFFER_BYTES;
+      this._buffer = this._buffer.slice(-MAX_BUFFER_BYTES);
+      this._readCursor = Math.max(0, this._readCursor - overflow);
+    }
+
+    this._appendToHistory(str);
+
+    const listeners = this._dataListeners.slice();
+    for (const listener of listeners) {
+      listener(str);
+    }
+  }
+
+  sendSignal(signal) {
+    if (!this.alive) return;
+
+    if (this.ptydClient && this._daemonSessionId !== null) {
+      try {
+        this.ptydClient.signal(this._daemonSessionId, signal);
+      } catch {}
+      return;
+    }
+
+    // Standalone mode
+    // For SIGINT, write the interrupt byte to the PTY instead of using kill().
+    // This is how real terminals work: the TTY driver sends SIGINT to the
+    // foreground process group, which avoids killing the PTY helper process.
+    if (signal === "SIGINT") {
+      try {
+        this._writeToPty("\x03");
+      } catch {}
+      return;
+    }
+
+    // For other signals, send to the entire process group
+    if (
+      (this._ptyMode === "direct" || this._ptyMode === "helper") &&
+      this.process?.pid
+    ) {
+      try {
+        process.kill(-this.process.pid, signal);
+      } catch {}
+    } else {
+      try {
+        this.process?.kill(signal);
+      } catch {}
+    }
   }
 
   /**
@@ -188,6 +587,10 @@ export class PtySession {
    * @returns {Promise<string>}
    */
   async waitForBanner() {
+    // Auto-initialize if not already done (standalone or daemon mode)
+    if (!this._initialized) {
+      await this.init();
+    }
     const banner = await this._readUntilIdle(BANNER_WAIT_MS, BANNER_IDLE_MS);
     // Run shell-specific init commands after banner
     await this._initShell();
@@ -211,9 +614,19 @@ export class PtySession {
    * @param {string|number} [opts.progressToken] - Progress token from client
    * @returns {Promise<{ output: string, exitCode: number|null, cwd: string|null, timedOut: boolean, quietExited?: boolean, hint?: string }>}
    */
-  async exec({ command, timeout = 30000, maxLines = DEFAULT_EXEC_MAX_LINES, quietExitMs, minOutputBytes = 1, sendNotification, progressToken }) {
+  async exec({
+    command,
+    timeout = 30000,
+    maxLines = DEFAULT_EXEC_MAX_LINES,
+    quietExitMs,
+    minOutputBytes = 1,
+    sendNotification,
+    progressToken,
+  }) {
     if (this.busy) {
-      throw new Error(`Session ${this.id} is busy with a background command. Wait for it to finish, or use terminal_read to check output, or terminal_send_key("ctrl+c") to abort it.`);
+      throw new Error(
+        `Session ${this.id} is busy with a background command. Wait for it to finish, or use terminal_read to check output, or terminal_send_key("ctrl+c") to abort it.`,
+      );
     }
     if (!this.alive) {
       throw new Error(`Session ${this.id} is no longer alive.`);
@@ -222,20 +635,37 @@ export class PtySession {
     this.busy = true;
     this._resetBuffer();
 
-    const marker = `__MCP_DONE_${randomUUID().replace(/-/g, '')}__`;
+    const marker = `__MCP_DONE_${randomUUID().replace(/-/g, "")}__`;
     const cwdMarker = `__MCP_CWD_`;
-    const preMarker = `__MCP_PRE_${randomUUID().replace(/-/g, '')}__`;
-    const wrappedCommand = this._wrapCommand(command, marker, cwdMarker, preMarker);
+    const preMarker = `__MCP_PRE_${randomUUID().replace(/-/g, "")}__`;
+    const wrappedCommand = this._wrapCommand(
+      command,
+      marker,
+      cwdMarker,
+      preMarker,
+    );
 
     try {
-      this.ptydClient.write(this._daemonSessionId, wrappedCommand + '\r');
+      this._writeToPty(wrappedCommand + "\r");
 
-      const { buffer: raw, reason } = await this._waitForMarker(marker, timeout, quietExitMs, minOutputBytes, sendNotification, progressToken);
+      const { buffer: raw, reason } = await this._waitForMarker(
+        marker,
+        timeout,
+        quietExitMs,
+        minOutputBytes,
+        sendNotification,
+        progressToken,
+      );
       const markerFound = raw.includes(marker);
-      const timedOut = reason === 'timeout';
-      const quietExited = reason === 'quiet';
+      const timedOut = reason === "timeout";
+      const quietExited = reason === "quiet";
 
-      const { output, exitCode, cwd } = this._parseOutput(raw, marker, cwdMarker, preMarker);
+      const { output, exitCode, cwd } = this._parseOutput(
+        raw,
+        marker,
+        cwdMarker,
+        preMarker,
+      );
       if (cwd) this.cwd = cwd;
 
       if (markerFound) {
@@ -251,7 +681,9 @@ export class PtySession {
         cwd: this.cwd,
         timedOut,
         ...(quietExited && { quietExited: true }),
-        ...((timedOut || quietExited) && { hint: 'Command is still running in the background. Session remains busy. Use terminal_read to get new output, or terminal_send_key("ctrl+c") to abort.' }),
+        ...((timedOut || quietExited) && {
+          hint: 'Command is still running in the background. Session remains busy. Use terminal_read to get new output, or terminal_send_key("ctrl+c") to abort.',
+        }),
       };
     } catch (err) {
       this.busy = false;
@@ -268,8 +700,8 @@ export class PtySession {
     if (!this.alive) {
       throw new Error(`Session ${this.id} is no longer alive.`);
     }
-    this.ptydClient.write(this._daemonSessionId, data);
-    if (data.includes('\x03') || data.includes('\x04')) {
+    this._writeToPty(data);
+    if (data.includes("\x03") || data.includes("\x04")) {
       this.busy = false;
       this._pendingMarker = null;
     }
@@ -282,7 +714,9 @@ export class PtySession {
   sendKey(key) {
     const seq = KEY_MAP[key.toLowerCase()];
     if (!seq) {
-      throw new Error(`Unknown key: "${key}". Supported: ${SUPPORTED_KEYS.join(', ')}`);
+      throw new Error(
+        `Unknown key: "${key}". Supported: ${SUPPORTED_KEYS.join(", ")}`,
+      );
     }
     this.write(seq);
   }
@@ -296,12 +730,21 @@ export class PtySession {
    * @param {number} [opts.since] - Absolute byte position; returns output emitted since that position
    * @returns {Promise<{ output: string, timedOut: boolean, position: number, truncated?: boolean }>}
    */
-  async read({ timeout = 30000, idleTimeout = 500, maxLines = DEFAULT_READ_MAX_LINES, since } = {}) {
+  async read({
+    timeout = 30000,
+    idleTimeout = 500,
+    maxLines = DEFAULT_READ_MAX_LINES,
+    since,
+  } = {}) {
     if (!this.alive) {
       // Return whatever is left in buffer
       const leftover = stripAnsi(this._consumeUnreadBuffer()).trim();
       this._resetBuffer();
-      return { output: leftover, timedOut: false, position: this._totalBytesEmitted };
+      return {
+        output: leftover,
+        timedOut: false,
+        position: this._totalBytesEmitted,
+      };
     }
 
     // Position-based read: return only output since a prior byte position
@@ -345,7 +788,7 @@ export class PtySession {
 
     const regex = compileUserRegex(pattern);
     const startTime = Date.now();
-    let collected = '';
+    let collected = "";
     let lastProgressAt = 0;
     const tailTracker = this._createTailTracker();
 
@@ -359,7 +802,12 @@ export class PtySession {
       const timer = setTimeout(() => {
         cleanup();
         resolve({
-          output: this._formatWaitOutput(stripAnsi(collected), returnMode, tailLines, tailTracker),
+          output: this._formatWaitOutput(
+            stripAnsi(collected),
+            returnMode,
+            tailLines,
+            tailTracker,
+          ),
           matched: false,
           timedOut: true,
         });
@@ -371,15 +819,30 @@ export class PtySession {
         const clean = stripAnsi(collected);
 
         // Send progress notifications
-        if (sendNotification && progressToken && Date.now() - lastProgressAt > 1000) {
+        if (
+          sendNotification &&
+          progressToken &&
+          Date.now() - lastProgressAt > 1000
+        ) {
           lastProgressAt = Date.now();
-          this._sendProgress(sendNotification, progressToken, clean, startTime, timeout);
+          this._sendProgress(
+            sendNotification,
+            progressToken,
+            clean,
+            startTime,
+            timeout,
+          );
         }
 
         if (regex.test(clean)) {
           cleanup();
           resolve({
-            output: this._formatWaitOutput(clean, returnMode, tailLines, tailTracker),
+            output: this._formatWaitOutput(
+              clean,
+              returnMode,
+              tailLines,
+              tailTracker,
+            ),
             matched: true,
             timedOut: false,
           });
@@ -392,7 +855,12 @@ export class PtySession {
       if (regex.test(existingClean)) {
         clearTimeout(timer);
         resolve({
-          output: this._formatWaitOutput(existingClean, returnMode, tailLines, tailTracker),
+          output: this._formatWaitOutput(
+            existingClean,
+            returnMode,
+            tailLines,
+            tailTracker,
+          ),
           matched: true,
           timedOut: false,
         });
@@ -427,7 +895,10 @@ export class PtySession {
     const fromPos = truncated ? bufferStart : since;
     const offset = fromPos - bufferStart;
 
-    const raw = offset < this._buffer.length ? this._buffer.slice(Math.max(0, offset)) : '';
+    const raw =
+      offset < this._buffer.length
+        ? this._buffer.slice(Math.max(0, offset))
+        : "";
     const output = stripAnsi(raw).trim();
 
     return {
@@ -449,10 +920,19 @@ export class PtySession {
    * @param {number} [opts.since]
    * @returns {Promise<{reason: 'trigger'|'quiet'|'timeout'|'exit', triggerId?: string, matchedLine?: string, context?: string[], position: number, timedOut: boolean}>}
    */
-  watch({ triggers, timeout = 60000, quietExitMs, contextLines = 3, since } = {}) {
+  watch({
+    triggers,
+    timeout = 60000,
+    quietExitMs,
+    contextLines = 3,
+    since,
+  } = {}) {
     const compiled = triggers.map((t) => ({
       id: t.id,
-      regex: t.isRegex === false ? new RegExp(t.pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) : compileUserRegex(t.pattern),
+      regex:
+        t.isRegex === false
+          ? new RegExp(t.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          : compileUserRegex(t.pattern),
       cooldownMs: t.cooldownMs ?? 0,
       lastFiredAt: 0,
     }));
@@ -461,7 +941,7 @@ export class PtySession {
 
     return new Promise((resolve) => {
       const contextBuffer = [];
-      let partialLine = '';
+      let partialLine = "";
       let resolved = false;
       let quietTimer;
       let exitCheckTimer;
@@ -478,25 +958,37 @@ export class PtySession {
       };
 
       const hardTimer = setTimeout(() => {
-        done({ reason: 'timeout', timedOut: true, position: this._totalBytesEmitted });
+        done({
+          reason: "timeout",
+          timedOut: true,
+          position: this._totalBytesEmitted,
+        });
       }, timeout);
 
       const armQuiet = () => {
         if (!quietExitMs) return;
         clearTimeout(quietTimer);
         quietTimer = setTimeout(() => {
-          done({ reason: 'quiet', timedOut: false, position: this._totalBytesEmitted });
+          done({
+            reason: "quiet",
+            timedOut: false,
+            position: this._totalBytesEmitted,
+          });
         }, quietExitMs);
       };
 
       const testLine = (line) => {
         const now = Date.now();
         for (const trigger of compiled) {
-          if (trigger.cooldownMs > 0 && now - trigger.lastFiredAt < trigger.cooldownMs) continue;
+          if (
+            trigger.cooldownMs > 0 &&
+            now - trigger.lastFiredAt < trigger.cooldownMs
+          )
+            continue;
           if (trigger.regex.test(line)) {
             trigger.lastFiredAt = now;
             done({
-              reason: 'trigger',
+              reason: "trigger",
               triggerId: trigger.id,
               matchedLine: line,
               context: contextBuffer.slice(-contextLines),
@@ -541,7 +1033,8 @@ export class PtySession {
           for (const line of parts) {
             if (line.trim()) {
               contextBuffer.push(line);
-              if (contextBuffer.length > contextLines + 1) contextBuffer.shift();
+              if (contextBuffer.length > contextLines + 1)
+                contextBuffer.shift();
               testLine(line);
               if (resolved) return;
             }
@@ -552,7 +1045,11 @@ export class PtySession {
       // Handle process exit during watch
       exitCheckTimer = setInterval(() => {
         if (!this.alive) {
-          done({ reason: 'exit', timedOut: false, position: this._totalBytesEmitted });
+          done({
+            reason: "exit",
+            timedOut: false,
+            position: this._totalBytesEmitted,
+          });
         }
       }, 200);
 
@@ -570,7 +1067,16 @@ export class PtySession {
     if (!this.alive) {
       throw new Error(`Session ${this.id} is no longer alive.`);
     }
-    this.ptydClient.resize(this._daemonSessionId, cols, rows);
+    if (this.ptydClient && this._daemonSessionId !== null) {
+      this.ptydClient.resize(this._daemonSessionId, cols, rows);
+    } else if (this._ptyMode !== null) {
+      // Standalone mode: send stty resize command to the PTY
+      // This works because stty operates on the terminal controlling the PTY slave
+      // We hard-set the columns and rows via stty
+      this._writeToPty(`stty cols ${cols} rows ${rows}\n`);
+      // Send SIGWINCH to the child's process group so apps can react
+      this.sendSignal("SIGWINCH");
+    }
     this.cols = cols;
     this.rows = rows;
   }
@@ -580,12 +1086,25 @@ export class PtySession {
    * Sends signal to the entire process group via the daemon.
    * @param {string} [signal='SIGTERM']
    */
-  kill(signal = 'SIGTERM') {
+  kill(signal = "SIGTERM") {
     if (!this.alive) return;
     if (this._daemonSessionId !== null) {
-      try { this.ptydClient.signal(this._daemonSessionId, signal); } catch {}
+      try {
+        this.ptydClient.signal(this._daemonSessionId, signal);
+      } catch {}
+      this.alive = false;
+      return;
+    }
+    // Standalone mode
+    if (this._ptyMode === "direct" || this._ptyMode === "helper") {
+      this.sendSignal(signal);
+    } else {
+      try {
+        this.process?.kill(signal);
+      } catch {}
     }
     this.alive = false;
+    this._cleanupPty();
   }
 
   /**
@@ -626,7 +1145,11 @@ export class PtySession {
    * @param {'lines'|'text'} [opts.format='lines'] - History response format
    * @returns {{ lines: string[], totalLines: number, returnedFrom: number, returnedTo: number } | { text: string, totalLines: number, returnedFrom: number, returnedTo: number }}
    */
-  getHistory({ offset = 0, limit = DEFAULT_HISTORY_LIMIT, format = DEFAULT_HISTORY_FORMAT } = {}) {
+  getHistory({
+    offset = 0,
+    limit = DEFAULT_HISTORY_LIMIT,
+    format = DEFAULT_HISTORY_FORMAT,
+  } = {}) {
     const len = this._history.length;
     const end = Math.max(0, len - offset);
     const start = Math.max(0, end - limit);
@@ -640,10 +1163,10 @@ export class PtySession {
       returnedTo: evicted + end,
     };
 
-    if (format === 'text') {
+    if (format === "text") {
       return {
         ...result,
-        text: lines.join('\n'),
+        text: lines.join("\n"),
       };
     }
 
@@ -680,11 +1203,11 @@ export class PtySession {
   }
 
   _wrapCommand(command, marker, cwdMarker, preMarker) {
-    return `echo "${preMarker}"; ${command}; echo "${marker}_$?__"; echo "${cwdMarker}$(pwd)__"`;
+    return `echo "${preMarker}"; ${command}; echo "${cwdMarker}$(pwd)__"; echo "${marker}_$?__"`;
   }
 
   _resetBuffer() {
-    this._buffer = '';
+    this._buffer = "";
     this._readCursor = 0;
   }
 
@@ -705,7 +1228,14 @@ export class PtySession {
    * @param {string|number} [progressToken]
    * @returns {Promise<{buffer: string, reason: 'marker'|'timeout'|'quiet'}>}
    */
-  _waitForMarker(marker, timeout, quietExitMs, minOutputBytes = 1, sendNotification, progressToken) {
+  _waitForMarker(
+    marker,
+    timeout,
+    quietExitMs,
+    minOutputBytes = 1,
+    sendNotification,
+    progressToken,
+  ) {
     return new Promise((resolve) => {
       const startTime = Date.now();
       let lastProgressAt = 0;
@@ -721,7 +1251,7 @@ export class PtySession {
 
       const timer = setTimeout(() => {
         cleanup();
-        resolve({ buffer: this._buffer, reason: 'timeout' });
+        resolve({ buffer: this._buffer, reason: "timeout" });
       }, timeout);
 
       const armQuiet = () => {
@@ -729,7 +1259,7 @@ export class PtySession {
         clearTimeout(quietTimer);
         quietTimer = setTimeout(() => {
           cleanup();
-          resolve({ buffer: this._buffer, reason: 'quiet' });
+          resolve({ buffer: this._buffer, reason: "quiet" });
         }, quietExitMs);
       };
 
@@ -739,17 +1269,27 @@ export class PtySession {
         const clean = stripAnsi(this._buffer);
         if (clean.includes(`\n${marker}`) || clean.startsWith(marker)) {
           cleanup();
-          resolve({ buffer: this._buffer, reason: 'marker' });
+          resolve({ buffer: this._buffer, reason: "marker" });
         }
       };
 
       const onData = (_data) => {
         bytesSeen += _data.length;
         // Send progress
-        if (sendNotification && progressToken && Date.now() - lastProgressAt > 1000) {
+        if (
+          sendNotification &&
+          progressToken &&
+          Date.now() - lastProgressAt > 1000
+        ) {
           lastProgressAt = Date.now();
           const clean = stripAnsi(this._buffer);
-          this._sendProgress(sendNotification, progressToken, clean, startTime, timeout);
+          this._sendProgress(
+            sendNotification,
+            progressToken,
+            clean,
+            startTime,
+            timeout,
+          );
         }
         armQuiet();
         checkBuffer();
@@ -766,7 +1306,7 @@ export class PtySession {
    */
   _readUntilIdle(timeout, idleTimeout) {
     return new Promise((resolve) => {
-      let collected = '';
+      let collected = "";
       let idleTimer;
       let resolved = false;
 
@@ -850,7 +1390,7 @@ export class PtySession {
       outputLines.push(line);
     }
 
-    const output = outputLines.join('\n').trim();
+    const output = outputLines.join("\n").trim();
     return { output, exitCode, cwd };
   }
 
@@ -858,7 +1398,7 @@ export class PtySession {
    * Truncate output to maxLines: head(maxLines/2) + "...omitted..." + tail(maxLines/2).
    */
   _truncateOutput(output, maxLines) {
-    const lines = output.split('\n');
+    const lines = output.split("\n");
     if (lines.length <= maxLines) return output;
 
     const headCount = Math.floor(maxLines / 2);
@@ -867,15 +1407,17 @@ export class PtySession {
     const tail = lines.slice(-tailCount);
     const omitted = lines.length - headCount - tailCount;
 
-    return [...head, `\n... ${omitted} lines omitted ...\n`, ...tail].join('\n');
+    return [...head, `\n... ${omitted} lines omitted ...\n`, ...tail].join(
+      "\n",
+    );
   }
 
   _formatWaitOutput(output, returnMode, tailLines, tailTracker) {
     const trimmedOutput = output.trim();
-    if (!trimmedOutput || returnMode === 'match-only') {
-      return '';
+    if (!trimmedOutput || returnMode === "match-only") {
+      return "";
     }
-    if (returnMode === 'full') {
+    if (returnMode === "full") {
       return trimmedOutput;
     }
     if (tailTracker) {
@@ -885,23 +1427,23 @@ export class PtySession {
   }
 
   _tailOutput(output, tailLines) {
-    const lines = output.split('\n');
+    const lines = output.split("\n");
     if (lines.length <= tailLines) {
       return output;
     }
-    return lines.slice(-tailLines).join('\n');
+    return lines.slice(-tailLines).join("\n");
   }
 
   _createTailTracker() {
     return {
       lines: [],
-      partial: '',
+      partial: "",
     };
   }
 
   _appendToTailTracker(tracker, cleanData, tailLines) {
     const parts = cleanData.split(/\r?\n/);
-    tracker.partial += parts[0] ?? '';
+    tracker.partial += parts[0] ?? "";
 
     for (let i = 1; i < parts.length; i++) {
       tracker.lines.push(tracker.partial);
@@ -915,17 +1457,20 @@ export class PtySession {
   }
 
   _tailTrackerToOutput(tracker) {
-    const lines = tracker.partial ? [...tracker.lines, tracker.partial] : tracker.lines;
-    return lines.join('\n').trim();
+    const lines = tracker.partial
+      ? [...tracker.lines, tracker.partial]
+      : tracker.lines;
+    return lines.join("\n").trim();
   }
 
   _sendProgress(sendNotification, progressToken, content, startTime, timeout) {
     try {
-      const lines = content.split('\n').filter(Boolean);
-      const lastLine = lines.length > 0 ? lines[lines.length - 1].slice(0, 200) : '';
+      const lines = content.split("\n").filter(Boolean);
+      const lastLine =
+        lines.length > 0 ? lines[lines.length - 1].slice(0, 200) : "";
       const elapsed = Math.round((Date.now() - startTime) / 1000);
       sendNotification({
-        method: 'notifications/progress',
+        method: "notifications/progress",
         params: {
           progressToken,
           progress: Date.now() - startTime,

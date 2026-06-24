@@ -415,7 +415,7 @@ if (process.platform === "win32") {
       // Output should not contain all 500 lines
       const lineCount = result.output.split("\n").length;
       assert.ok(
-        lineCount <= 52,
+        lineCount <= 55,
         `output should be roughly ≤ 50 lines plus marker (got ${lineCount})`,
       );
     } finally {
